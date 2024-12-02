@@ -34,6 +34,7 @@ __all__ = [
     "ConfigError",
     "LMError",
     "LanguageModelNotFoundError",
+    "FeatureGenerationError",
     "ModelExtensionError",
     "ThirdpartyError",
     "IvectorTrainingError",
@@ -45,6 +46,7 @@ __all__ = [
     "CorpusReadError",
     "AlignerError",
     "AlignmentError",
+    "AlignmentCollectionError",
     "AlignmentExportError",
     "NoSuccessfulAlignments",
     "KaldiProcessingError",
@@ -304,6 +306,34 @@ class PhoneMismatchError(DictionaryError):
         self.message_lines.append(comma_join(missing_phones))
 
 
+class PhoneGroupTopologyMismatchError(DictionaryError):
+    """
+    Exception class for when a dictionary receives a new phone
+
+    Parameters
+    ----------
+    error_topologies: List[Tuple[List[str], List[Tuple[int, int]]]]
+        Phones that are not in the acoustic model
+    """
+
+    def __init__(
+        self,
+        error_topologies: typing.List[
+            typing.Tuple[typing.List[str], typing.List[typing.Tuple[int, int]]]
+        ],
+        phone_groups_path: typing.Union[Path, str],
+        topologies_path: typing.Union[Path, str],
+    ):
+        super().__init__("There were multiple topologies found for phones in the same group: ")
+        for k, v in error_topologies:
+            v = [f"(min_states = {x[0]}, max_states = {x[1]})" for x in v]
+            self.message_lines.append(f"{comma_join(k)}: {comma_join(v)}")
+        self.message_lines.append(
+            f"Please update {phone_groups_path} or {topologies_path} to "
+            f"ensure that phone groups have a single set of minimum and maximum states"
+        )
+
+
 class NoDefaultSpeakerDictionaryError(DictionaryError):
     """
     Exception class for errors in creating MultispeakerDictionary objects
@@ -337,15 +367,13 @@ class DictionaryFileError(DictionaryError):
 
     Parameters
     ----------
-    input_path: :class:`~pathlib.Path`
-        Path of the pronunciation dictionary
+    message: str
+        Error message
     """
 
-    def __init__(self, input_path: Path):
+    def __init__(self, message: str):
         super().__init__("")
-        self.message_lines = [
-            f"The specified path for the dictionary ({input_path}) is not a file."
-        ]
+        self.message_lines = [message]
 
 
 # Corpus Errors
@@ -504,6 +532,44 @@ class AlignmentError(MFAError):
         ]
         for path in error_logs:
             self.message_lines.append(path)
+
+
+class AlignmentCollectionError(MFAError):
+    """
+    Class for errors during alignment
+
+    Parameters
+    ----------
+    sound_file_path: str or :class:`~pathlib.Path`
+        Sound file associated with utterance that hit an error
+    text_file_path: str or :class:`~pathlib.Path`
+        Text file associated with utterance that hit an error
+    utterance_begin: float
+        Utterance beginning timestamp
+    utterance_end: float
+        Utterance end timestamp
+    traceback: list[str]
+        Traceback of the exception encountered
+    log_path: str or :class:`~pathlib.Path`, optional
+        Path to log file if saved
+    """
+
+    def __init__(
+        self,
+        sound_file_path: typing.Union[str, Path],
+        text_file_path: typing.Union[str, Path],
+        utterance_begin: float,
+        utterance_end: float,
+        traceback: typing.List[str],
+        log_path: typing.Union[str, Path] = None,
+    ):
+        super().__init__("")
+        self.message_lines.extend(traceback)
+        self.message_lines.append(
+            f"The above error was encountered for the utterance from {utterance_begin} to {utterance_end} for {sound_file_path} and {text_file_path}."
+        )
+        if log_path is not None:
+            self.message_lines.append(f"This error has been logged to {log_path}.")
 
 
 class AlignmentExportError(AlignmentError):

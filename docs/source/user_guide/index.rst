@@ -91,7 +91,6 @@ Contributors
   - :fa:`envelope` michael.e.mcauliffe@gmail.com
   - :fa:`blog` :xref:`memcauliffe.com`
   - :fa:`square` :xref:`@mmcauliffe.bsky.social`
-  - :fa:`twitter` :xref:`@wavable`
 
 * :xref:`socolof`
 * :xref:`stengel-eskin`
@@ -132,7 +131,7 @@ We acknowledge funding from Social Sciences and Humanities Research Council (SSH
    data_validation
    dictionary
    dictionary_validation
-   performance
+   troubleshooting
    workflows/index
    corpus_creation/index
    configuration/index

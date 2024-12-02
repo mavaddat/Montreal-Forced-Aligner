@@ -6,7 +6,7 @@ import abc
 import os
 import re
 import typing
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
 
@@ -18,15 +18,17 @@ from montreal_forced_aligner.helper import mfa_open
 if TYPE_CHECKING:
     from montreal_forced_aligner.abc import MetaDict
 
-DEFAULT_PUNCTUATION = list(r'、。।，？！!@<>→"”()“„–,.:;—¿?¡：）!\\&%#*~【】，…‥「」『』〝〟″⟨⟩♪・‹›«»～′$+=‘')
+DEFAULT_PUNCTUATION = list(
+    r'、。।，？！!@<>→"”()“„–,.:;—¿?¡：）|؟!\\&%#*،~【】，…‥「」『』〝〟″⟨⟩♪・‚‘‹›«»～′$+=‘۔―'
+)
 
-DEFAULT_WORD_BREAK_MARKERS = list(r'？！!()，,.:;¡¿?“„"”&~%#—…‥、。【】$+=〝〟″‹›«»・⟨⟩「」『』')
+DEFAULT_WORD_BREAK_MARKERS = list(r'？！!()，,.:;¡¿?“„"”&~%#—…‥、。|【】$+=〝〟″‹›«»・⟨⟩،「」『』؟')
 
 DEFAULT_QUOTE_MARKERS = list("“„\"”〝〟″「」『』‚ʻʿ‘′'")
 
 DEFAULT_CLITIC_MARKERS = list("'’‘")
-DEFAULT_COMPOUND_MARKERS = list("-/")
-DEFAULT_BRACKETS = [("[", "]"), ("{", "}"), ("<", ">"), ("(", ")"), ("＜", "＞")]
+DEFAULT_COMPOUND_MARKERS = list("-‑/")
+DEFAULT_BRACKETS = [("<", ">"), ("[", "]"), ("{", "}"), ("(", ")"), ("＜", "＞")]
 
 __all__ = ["DictionaryMixin", "TemporaryDictionaryMixin"]
 
@@ -115,6 +117,7 @@ class DictionaryMixin:
         preserve_suprasegmentals: bool = False,
         base_phone_mapping: Dict[str, str] = None,
         use_cutoff_model: bool = False,
+        cutoff_word: str = "<cutoff>",
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -151,7 +154,9 @@ class DictionaryMixin:
         self.oov_word = oov_word
         self.silence_word = silence_word
         self.bracketed_word = "[bracketed]"
-        self.cutoff_word = "<cutoff>"
+        self.cutoff_word = cutoff_word
+        if (self.cutoff_word[0], self.cutoff_word[-1]) not in self.brackets:
+            self.cutoff_word = f"{self.brackets[0][0]}{self.cutoff_word}{self.brackets[0][1]}"
         self.laughter_word = "[laughter]"
         self.position_dependent_phones = position_dependent_phones
         self.optional_silence_phone = optional_silence_phone
@@ -185,6 +190,7 @@ class DictionaryMixin:
         self.bracket_sanitize_regex = None
         self.use_cutoff_model = use_cutoff_model
         self._phone_groups = {}
+        self._topologies = {}
 
     @property
     def tokenizer(self):
@@ -254,11 +260,7 @@ class DictionaryMixin:
     @property
     def extra_questions_mapping(self) -> Dict[str, List[str]]:
         """Mapping of extra questions for the given phone set type"""
-        mapping = {"silence_question": []}
-        for p in sorted(self.silence_phones):
-            mapping["silence_question"].append(p)
-            if self.position_dependent_phones:
-                mapping["silence_question"].extend([p + x for x in self.positions])
+        mapping = {}
         for k, v in self.phone_set_type.extra_questions.items():
             if k not in mapping:
                 mapping[k] = []
@@ -353,6 +355,7 @@ class DictionaryMixin:
             self.oov_word,
             self.bracketed_word,
             self.laughter_word,
+            self.cutoff_word,
             "<s>",
             "</s>",
         }
@@ -421,7 +424,8 @@ class DictionaryMixin:
             List of positional phones, sorted by base phone
         """
         positional_phones = []
-        phones |= {self.get_base_phone(p) for p in phones}
+        if not hasattr(self, "acoustic_model"):
+            phones |= {self.get_base_phone(p) for p in phones}
         for p in sorted(phones):
             if p not in self.non_silence_phones:
                 continue
@@ -486,6 +490,12 @@ class DictionaryMixin:
 
     @property
     def phone_groups(self) -> typing.Dict[str, typing.List[str]]:
+        if (
+            not self._phone_groups
+            and getattr(self, "phone_group_path", None)
+            and hasattr(self, "load_phone_groups")
+        ):
+            self.load_phone_groups()
         if not self._phone_groups:
             for p in sorted(self.non_silence_phones):
                 base_phone = self.get_base_phone(p)
@@ -553,7 +563,6 @@ class TemporaryDictionaryMixin(DictionaryMixin, DatabaseMixin, metaclass=abc.ABC
     """
 
     def __init__(self, **kwargs):
-
         super().__init__(**kwargs)
         self._disambiguation_symbols_int_path = None
         self._phones_dir = None
@@ -661,8 +670,14 @@ class TemporaryDictionaryMixin(DictionaryMixin, DatabaseMixin, metaclass=abc.ABC
         """
         Write the topo file to the temporary directory
         """
-
+        if (
+            not self._topologies
+            and getattr(self, "topology_path", None)
+            and hasattr(self, "load_phone_topologies")
+        ):
+            self.load_phone_topologies()
         sil_transp = 1 / (self.num_silence_states - 1)
+        topo_groups = defaultdict(set)
 
         silence_lines = [
             "<TopologyEntry>",
@@ -690,9 +705,16 @@ class TemporaryDictionaryMixin(DictionaryMixin, DatabaseMixin, metaclass=abc.ABC
         silence_topo_string = "\n".join(silence_lines)
 
         topo_sections = [silence_topo_string]
-        topo_phones = self._get_grouped_phones()
 
-        for phone_list in topo_phones.values():
+        for k, v in self._topologies.items():
+            min_states = v.get("min_states", 1)
+            max_states = v.get("max_states", self.num_non_silence_states)
+            topo_groups[(min_states, max_states)].add(k)
+        for phone in self.non_silence_phones:
+            if phone not in self._topologies:
+                topo_groups[(1, self.num_non_silence_states)].add(phone)
+
+        for (min_states, max_states), phone_list in topo_groups.items():
             if not phone_list:
                 continue
             non_silence_lines = [
@@ -703,26 +725,28 @@ class TemporaryDictionaryMixin(DictionaryMixin, DatabaseMixin, metaclass=abc.ABC
                 ),
                 "</ForPhones>",
             ]
-            # num_states = state_mapping[phone_type]
-            num_states = self.num_non_silence_states
+            num_states = max_states
 
             for i in range(num_states):
                 if i == 0:  # Initial non_silence state
-                    transition_probability = 1 / self.num_non_silence_states
-                    transition_string = " ".join(
-                        f"<Transition> {x} {transition_probability}"
-                        for x in range(1, self.num_non_silence_states + 1)
-                    )
+                    if min_states == max_states:
+                        transition_string = f"<Transition> {i} 0.5 <Transition> {i + 1} 0.5"
+                    else:
+                        transition_probability = 1 / max_states
+                        transition_string = " ".join(
+                            f"<Transition> {x} {transition_probability}"
+                            for x in range(min_states, max_states + 1)
+                        )
                     non_silence_lines.append(
                         f"<State> {i} <PdfClass> {i} {transition_string} </State>"
                     )
                 elif i == num_states - 1:
                     non_silence_lines.append(
-                        f"<State> {i} <PdfClass> {i} <Transition> {i+1} 1.0 </State>"
+                        f"<State> {i} <PdfClass> {i} <Transition> {i + 1} 1.0 </State>"
                     )
                 else:
                     non_silence_lines.append(
-                        f"<State> {i} <PdfClass> {i} <Transition> {i} 0.5 <Transition> {i+1} 0.5 </State>"
+                        f"<State> {i} <PdfClass> {i} <Transition> {i} 0.5 <Transition> {i + 1} 0.5 </State>"
                     )
             non_silence_lines.append(f"<State> {num_states} </State>")
             non_silence_lines.append("</TopologyEntry>")
@@ -746,9 +770,19 @@ class TemporaryDictionaryMixin(DictionaryMixin, DatabaseMixin, metaclass=abc.ABC
                 else:
                     mapped = [sp]
                 phone_sets.append([self.phone_mapping[x] for x in mapped])
+        found_phones = set()
         for group in self.kaldi_grouped_phones.values():
+            for x in group:
+                if x in found_phones:
+                    raise Exception(f"The phone {x} in multiple phone groups.")
+            found_phones.update(group)
             group = sorted(self.phone_mapping[x] for x in group)
             phone_sets.append(group)
+        missing_phones = self.non_silence_phones - found_phones
+        if missing_phones:
+            raise Exception(
+                f"The following phones were missing from phone groups: {', '.join(missing_phones)}"
+            )
         return phone_sets
 
     def shared_phones_roots(self):
@@ -781,7 +815,6 @@ class TemporaryDictionaryMixin(DictionaryMixin, DatabaseMixin, metaclass=abc.ABC
         with mfa_open(sets_file, "w") as setf, mfa_open(roots_file, "w") as rootf, mfa_open(
             sets_int_file, "w"
         ) as setintf, mfa_open(roots_int_file, "w") as rootintf:
-
             # process silence phones
             if self.shared_silence_phones:
                 phone_string = " ".join(self.kaldi_silence_phones)

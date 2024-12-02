@@ -186,7 +186,7 @@ class PhonologicalRule:
         return " ".join(self.replacement)
 
     @property
-    def unapplied_pattern(self):
+    def unapplied_pattern(self) -> re.Pattern:
         if not hasattr(self, "_unapplied_pattern"):
             components = []
             preceding = self.preceding_regex
@@ -202,10 +202,10 @@ class PhonologicalRule:
             if following:
                 components.append(rf"(?P<following>{following})")
             pattern = " ".join(components)
-            if not self.initial:
-                pattern = r"(?:^|(?<=\s))" + pattern
-            if not self.final:
-                pattern += r"(?:$|(?=\s))"
+            if self.initial:
+                pattern = "^" + pattern
+            if self.final:
+                pattern += "$"
             return re.compile(pattern, flags=re.UNICODE)
         return self._unapplied_pattern
 
@@ -238,7 +238,6 @@ class PhonologicalRule:
             if following.endswith("$"):
                 following = following.replace("$", "").strip()
             if preceding:
-
                 components.append(rf"(?P<preceding>{preceding})")
             if self.replacement_regex:
                 components.append(rf"(?P<replacement>{self.replacement_regex})")
@@ -247,12 +246,8 @@ class PhonologicalRule:
             pattern = " ".join(components)
             if self.initial:
                 pattern = "^" + pattern
-            else:
-                pattern = r"(?:^|(?<=\s))" + pattern
             if self.final:
                 pattern += "$"
-            else:
-                pattern += r"(?:$|(?=\s))"
             return re.compile(pattern, flags=re.UNICODE)
         return self._applied_pattern
 
@@ -278,14 +273,14 @@ class MfaArguments:
     ----------
     job_name: int
         Integer ID of the job
-    db_string: str
-        String for database connections
+    session: :class:`sqlalchemy.orm.scoped_session` or str
+        SqlAlchemy scoped session or string for database connections
     log_path: :class:`~pathlib.Path`
         Path to save logging information during the run
     """
 
     job_name: int
-    session: scoped_session
+    session: typing.Union[scoped_session, str]
     log_path: Path
 
 
@@ -414,6 +409,18 @@ class WorkflowType(enum.Enum):
     g2p = 11
     language_model_training = 12
     tokenizer_training = 13
+    transcript_verification = 14
+
+    @classmethod
+    def alignment_workflows(cls):
+        return {
+            cls.alignment,
+            cls.online_alignment,
+            cls.transcript_verification,
+            cls.transcription,
+            cls.per_speaker_transcription,
+            cls.phone_transcription,
+        }
 
 
 class WordType(enum.Enum):
@@ -449,7 +456,6 @@ class WordType(enum.Enum):
 
 
 class DistanceMetric(enum.Enum):
-
     cosine = "cosine"
     plda = "plda"
     euclidean = "euclidean"
@@ -469,39 +475,128 @@ class ClusterType(enum.Enum):
     meanshift = "meanshift"
 
 
+ISO_LANGUAGE_MAPPING = {}
+
+
 class Language(enum.Enum):
     """Enum for supported languages"""
 
-    unknown = "unknown"
-    catalan = "catalan"
-    chinese = "chinese"
-    croatian = "croatian"
-    danish = "danish"
-    dutch = "dutch"
-    english = "english"
-    finnish = "finnish"
-    french = "french"
-    german = "german"
-    greek = "greek"
-    italian = "italian"
-    japanese = "japanese"
-    korean = "korean"
-    lithuanian = "lithuanian"
-    macedonian = "macedonian"
-    multilingual = "multilingual"
-    norwegian = "norwegian"
-    polish = "polish"
-    portuguese = "portuguese"
-    romanian = "romanian"
-    russian = "russian"
-    slovenian = "slovenian"
-    spanish = "spanish"
-    swedish = "swedish"
-    ukrainian = "ukrainian"
+    unknown = None
+    afrikaans = "af"
+    amharic = "am"
+    arabic = "ar"
+    assamese = "as"
+    azerbaijani = "az"
+    bashkir = "ba"
+    belarusian = "be"
+    bulgarian = "bg"
+    bengali = "bn"
+    tibetan = "bo"
+    breton = "br"
+    bosnian = "bs"
+    catalan = "ca"
+    czech = "cs"
+    welsh = "cy"
+    danish = "da"
+    german = "de"
+    greek = "el"
+    english = "en"
+    spanish = "es"
+    estonian = "et"
+    basque = "eu"
+    farsi = "fa"
+    finnish = "fi"
+    faroese = "fo"
+    french = "fr"
+    galician = "gl"
+    gujarati = "gu"
+    hausa = "ha"
+    hebrew = "he"
+    hindi = "hi"
+    croatian = "hr"
+    haitian = "ht"
+    hungarian = "hu"
+    armenian = "hy"
+    indonesian = "id"
+    icelandic = "is"
+    italian = "it"
+    japanese = "ja"
+    georgian = "ka"
+    kazakh = "kk"
+    central_khmer = "km"
+    kannada = "kn"
+    korean = "ko"
+    latin = "la"
+    luxembourgish = "lb"
+    lingala = "ln"
+    lao = "lo"
+    lithuanian = "lt"
+    latvian = "lv"
+    malagasy = "mg"
+    maori = "mi"
+    macedonian = "mk"
+    malayalam = "ml"
+    mongolian = "mn"
+    marathi = "mr"
+    malay = "ms"
+    maltese = "mt"
+    burmese = "my"
+    nepali = "ne"
+    dutch = "nl"
+    flemish = "nl"
+    norwegian_nynorsk = "nn"
+    norwegian = "no"
+    occitan = "oc"
+    punjabi = "pa"
+    polish = "pl"
+    pashto = "ps"
+    portuguese = "pt"
+    romanian = "ro"
+    moldavian = "ro"
+    russian = "ru"
+    sanskrit = "sa"
+    sindhi = "sd"
+    sinhala = "si"
+    slovak = "sk"
+    slovenian = "sl"
+    shona = "sn"
+    somali = "so"
+    albanian = "sq"
+    serbian = "sr"
+    sundanese = "su"
+    swedish = "sv"
+    swahili = "sw"
+    tamil = "ta"
+    telegu = "te"
+    tajik = "tg"
+    thai = "th"
+    turkmen = "tk"
+    tagalog = "tl"
+    turkish = "tr"
+    tatar = "tt"
+    ukrainian = "uk"
+    urdu = "ur"
+    uzbek = "uz"
+    vietnamese = "vi"
+    yiddish = "yi"
+    yoruba = "yo"
+    yue = "yue"
+    chinese = "zh"
+    kinyarwanda = "rw"
+    mandarin = "zh-CN"
+    multilingual = None
 
     def __str__(self) -> str:
         """Name of phone set"""
         return self.name
+
+    @property
+    def display_name(self):
+        return self.name.replace("_", " ").title()
+
+    @property
+    def iso_code(self) -> typing.Optional[str]:
+        return self.value
 
 
 class ManifoldAlgorithm(enum.Enum):
@@ -548,7 +643,7 @@ class PhoneSetType(enum.Enum):
     def suprasegmental_phone_regex(self) -> typing.Optional[re.Pattern]:
         """Regex for creating base phones"""
         if self is PhoneSetType.IPA:
-            return re.compile(r"([ː̟̥̂̀̄ˑ̊ᵝ̠̹̞̩̯̬̺ˤ̻̙̘̤̜̑̽᷈᷄᷅̌̋̏‿̆͜͡ˌ̍ʱʰʲ̚ʼ͈ˈ̣]+)")
+            return re.compile(r"([ː̟̥̂̀̄ˑ̊ᵝ̠̹̞̩̯̬̺ˤ̻̙̘̤̜̑̽᷈᷄᷅̌̋̏‿̆͜͡ˌ̍ʱʰʲʷ̚ʼ͈ˈ̣]+)")
         return None
 
     @property
@@ -559,7 +654,7 @@ class PhoneSetType(enum.Enum):
         elif self is PhoneSetType.PINYIN:
             return re.compile(r"[12345]")
         elif self is PhoneSetType.IPA:
-            return re.compile(r"([ː˩˨˧˦˥̟̥̂̀̄ˑ̊ᵝ̠̹̞̩̯̬̺ˀˤ̻̙̘̤̜̑̽᷈᷄᷅̌̋̏‿̆͜͡ˌ̍ˈ]+)")
+            return re.compile(r"([ː˩˨˧˦˥̟̥̂̀̄ˑʱʰʲʷ̊ᵝ̠̹̞̩̯̬̺ˀˤ̻̙̘̤̜̑̽᷈᷄᷅̌̋̏‿̆͜͡ˌ̍ˈʼ͈̚]+)")
         return None
 
     @property
@@ -602,6 +697,7 @@ class PhoneSetType(enum.Enum):
         if self is PhoneSetType.IPA:
             return {
                 "b",
+                "β",
                 "d",
                 "g",
                 "ɖ",
@@ -1403,8 +1499,7 @@ class PhoneSetType(enum.Enum):
 @dataclassy.dataclass(slots=True)
 class SoundFileInformation:
     """
-    Data class for sound file information with format, duration, number of channels, bit depth, and
-        sox_string for use in Kaldi feature extraction if necessary
+    Data class for sound file information with format, sampling rate, duration, and number of channels
 
     Parameters
     ----------
@@ -1414,17 +1509,14 @@ class SoundFileInformation:
         Sample rate
     duration: float
         Duration
-    sample_rate: int
-        Sample rate
-    sox_string: str
-        String to use for loading with sox
+    num_channels: int
+        Number of channels
     """
 
     format: str
     sample_rate: int
     duration: float
     num_channels: int
-    sox_string: str
 
     @property
     def meta(self) -> typing.Dict[str, typing.Any]:
@@ -1983,7 +2075,8 @@ class CtmInterval:
         begin = round(self.begin, 6)
         if file_duration is not None and end > file_duration:
             end = round(file_duration, 6)
-        assert begin < end
+        if begin >= end:
+            raise CtmError(self)
         return Interval(round(self.begin, 6), end, self.label)
 
 

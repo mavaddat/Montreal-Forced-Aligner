@@ -16,17 +16,23 @@ from _kalpy.matrix import DoubleVector
 from kalpy.gmm.data import AlignmentArchive
 from kalpy.gmm.utils import read_gmm_model
 from sqlalchemy.orm import joinedload, subqueryload
-from tqdm.rich import tqdm
 
 from montreal_forced_aligner import config
-from montreal_forced_aligner.abc import KaldiFunction, ModelExporterMixin, TopLevelMfaWorker
+from montreal_forced_aligner.abc import (
+    KaldiFunction,
+    MetaDict,
+    ModelExporterMixin,
+    TopLevelMfaWorker,
+)
 from montreal_forced_aligner.data import MfaArguments, WorkflowType
 from montreal_forced_aligner.db import (
     CorpusWorkflow,
     Dictionary,
     Job,
+    PhoneInterval,
     Speaker,
     Utterance,
+    WordInterval,
     bulk_update,
 )
 from montreal_forced_aligner.exceptions import ConfigError, KaldiProcessingError
@@ -38,7 +44,6 @@ from montreal_forced_aligner.utils import log_kaldi_errors, run_kaldi_function
 if TYPE_CHECKING:
     from dataclasses import dataclass
 
-    from montreal_forced_aligner.abc import MetaDict
     from montreal_forced_aligner.acoustic_modeling.base import AcousticModelTrainingMixin
     from montreal_forced_aligner.acoustic_modeling.pronunciation_probabilities import (
         PronunciationProbabilityTrainer,
@@ -82,7 +87,7 @@ class TransitionAccFunction(KaldiFunction):
         self.working_directory = args.working_directory
         self.model_path = args.model_path
 
-    def _run(self) -> typing.Generator[typing.Tuple[int, str]]:
+    def _run(self) -> None:
         """Run the function"""
 
         with self.session() as session:
@@ -95,6 +100,8 @@ class TransitionAccFunction(KaldiFunction):
             transition_model, acoustic_model = read_gmm_model(self.model_path)
             for dict_id in job.dictionary_ids:
                 ali_path = job.construct_path(self.working_directory, "ali", "ark", dict_id)
+                if not ali_path.exists():
+                    continue
                 transition_accs = DoubleVector(transition_model.NumTransitionIds() + 1)
                 alignment_archive = AlignmentArchive(ali_path)
                 for alignment in alignment_archive:
@@ -145,6 +152,9 @@ class TrainableAligner(TranscriberMixin, TopLevelMfaWorker, ModelExporterMixin):
         self,
         training_configuration: List[Tuple[str, Dict[str, Any]]] = None,
         phone_set_type: str = None,
+        model_version: str = None,
+        subset_word_count: int = 3,
+        minimum_utterance_length: int = 2,
         **kwargs,
     ):
         self.param_dict = {
@@ -156,6 +166,7 @@ class TrainableAligner(TranscriberMixin, TopLevelMfaWorker, ModelExporterMixin):
         }
         self.final_identifier = None
         self.current_subset: int = 0
+        self.subset_word_count = subset_word_count
         self.current_aligner: Optional[AcousticModelTrainingMixin] = None
         self.current_trainer: Optional[AcousticModelTrainingMixin] = None
         self.current_acoustic_model: Optional[AcousticModel] = None
@@ -174,6 +185,9 @@ class TrainableAligner(TranscriberMixin, TopLevelMfaWorker, ModelExporterMixin):
         for k, v in training_configuration:
             self.add_config(k, v)
         self.final_alignment = True
+        self.model_version = model_version
+        self.boost_silence = 1.5
+        self.minimum_utterance_length = minimum_utterance_length
 
     @classmethod
     def default_training_configurations(cls) -> List[Tuple[str, Dict[str, Any]]]:
@@ -186,23 +200,23 @@ class TrainableAligner(TranscriberMixin, TopLevelMfaWorker, ModelExporterMixin):
                 {
                     "subset": 20000,
                     "boost_silence": 1.25,
-                    "num_leaves": 2500,
+                    "num_leaves": 2000,
                     "max_gaussians": 10000,
                 },
             )
         )
         training_params.append(
-            ("lda", {"subset": 20000, "num_leaves": 3000, "max_gaussians": 15000})
+            ("lda", {"subset": 20000, "num_leaves": 2500, "max_gaussians": 15000})
         )
         training_params.append(
-            ("sat", {"subset": 20000, "num_leaves": 4000, "max_gaussians": 15000})
+            ("sat", {"subset": 20000, "num_leaves": 2500, "max_gaussians": 15000})
         )
         training_params.append(
-            ("sat", {"subset": 50000, "num_leaves": 5000, "max_gaussians": 40000})
+            ("sat", {"subset": 50000, "num_leaves": 4200, "max_gaussians": 40000})
         )
         training_params.append(("pronunciation_probabilities", {"subset": 50000}))
         training_params.append(
-            ("sat", {"subset": 150000, "num_leaves": 6000, "max_gaussians": 100000})
+            ("sat", {"subset": 150000, "num_leaves": 5000, "max_gaussians": 100000})
         )
         training_params.append(
             (
@@ -325,6 +339,12 @@ class TrainableAligner(TranscriberMixin, TopLevelMfaWorker, ModelExporterMixin):
                         update_mapping.append({"id": u_id, "ignored": True})
                         continue
                     words = text.split()
+                    if (
+                        self.minimum_utterance_length > 1
+                        and len(words) < self.minimum_utterance_length
+                    ):
+                        update_mapping.append({"id": u_id, "ignored": True})
+                        continue
                     if any(x in word_mapping for x in words):
                         continue
                     update_mapping.append({"id": u_id, "ignored": True})
@@ -335,7 +355,9 @@ class TrainableAligner(TranscriberMixin, TopLevelMfaWorker, ModelExporterMixin):
     def setup(self) -> None:
         """Setup for acoustic model training"""
         super().setup()
+        self.initialized = self.features_generated
         if self.initialized:
+            logger.info("Using previous initialization.")
             return
         try:
             self.load_corpus()
@@ -355,7 +377,7 @@ class TrainableAligner(TranscriberMixin, TopLevelMfaWorker, ModelExporterMixin):
         config.update(
             {
                 "dictionary_path": str(self.dictionary_model.path),
-                "corpus_directory": self.corpus_directory,
+                "corpus_directory": str(self.corpus_directory),
             }
         )
         return config
@@ -363,7 +385,10 @@ class TrainableAligner(TranscriberMixin, TopLevelMfaWorker, ModelExporterMixin):
     @property
     def meta(self) -> MetaDict:
         """Metadata about the final round of training"""
-        return self.training_configs[self.final_identifier].meta
+        meta = self.training_configs[self.final_identifier].meta
+        if self.model_version is not None:
+            meta["version"] = self.model_version
+        return meta
 
     def add_config(self, train_type: str, params: MetaDict) -> None:
         """
@@ -488,6 +513,59 @@ class TrainableAligner(TranscriberMixin, TopLevelMfaWorker, ModelExporterMixin):
         self.training_configs[self.final_identifier].export_model(output_model_path)
         logger.info(f"Saved model to {output_model_path}")
 
+    def quality_check_subset(self):
+        from _kalpy.util import Int32VectorWriter
+        from kalpy.gmm.data import AlignmentArchive
+        from kalpy.utils import generate_write_specifier
+
+        with self.session() as session:
+            utterance_ids = set(
+                x[0]
+                for x in session.query(Utterance.id)
+                .filter(Utterance.in_subset == True, Utterance.duration_deviation > 10)  # noqa
+                .all()
+            )
+            logger.debug(
+                f"Removing {len(utterance_ids)} utterances from subset due to large duration deviations"
+            )
+            bulk_update(session, Utterance, [{"id": x, "in_subset": False} for x in utterance_ids])
+            session.commit()
+            for j in self.jobs:
+                ali_paths = j.construct_path_dictionary(self.working_directory, "ali", "ark")
+                temp_ali_paths = j.construct_path_dictionary(
+                    self.working_directory, "temp_ali", "ark"
+                )
+                for dict_id, ali_path in ali_paths.items():
+                    if not ali_path.exists():
+                        continue
+                    new_path = temp_ali_paths[dict_id]
+                    write_specifier = generate_write_specifier(new_path)
+                    writer = Int32VectorWriter(write_specifier)
+                    alignment_archive = AlignmentArchive(ali_path)
+
+                    for alignment in alignment_archive:
+                        if alignment.utterance_id in utterance_ids:
+                            continue
+                        writer.Write(str(alignment.utterance_id), alignment.alignment)
+                    del alignment_archive
+                    writer.Close()
+                    ali_path.unlink()
+                    new_path.rename(ali_path)
+                    feat_path = j.construct_path(
+                        j.corpus.current_subset_directory, "feats", "scp", dictionary_id=dict_id
+                    )
+                    feat_lines = []
+                    with mfa_open(feat_path, "r") as feat_file:
+                        for line in feat_file:
+                            utterance_id = line.split(maxsplit=1)[0]
+                            if utterance_id in utterance_ids:
+                                continue
+                            feat_lines.append(line)
+
+                    with mfa_open(feat_path, "w") as feat_file:
+                        for line in feat_lines:
+                            feat_file.write(line)
+
     def train(self) -> None:
         """
         Run through the training configurations to produce a final acoustic model
@@ -510,14 +588,32 @@ class TrainableAligner(TranscriberMixin, TopLevelMfaWorker, ModelExporterMixin):
             if previous is not None:
                 self.set_current_workflow(f"{previous.identifier}_ali")
                 self.current_aligner = previous
-                os.makedirs(self.working_directory, exist_ok=True)
+                os.makedirs(self.working_log_directory, exist_ok=True)
                 self.current_acoustic_model = AcousticModel(
                     previous.exported_model_path, self.working_directory
                 )
-                self.align()
+                if (
+                    not self.current_workflow.done
+                    or not self.current_workflow.working_directory.exists()
+                ):
+                    self.align()
+                    with self.session() as session:
+                        session.query(WordInterval).delete()
+                        session.query(PhoneInterval).delete()
+                        session.commit()
+                    self.collect_alignments()
+                    self.analyze_alignments()
+                    if self.current_subset != 0:
+                        self.quality_check_subset()
+                else:
+                    logger.debug(f"Skipping {self.current_aligner.identifier} alignments")
 
             self.set_current_workflow(trainer.identifier)
             if trainer.identifier.startswith("pronunciation_probabilities"):
+                with self.session() as session:
+                    session.query(WordInterval).delete()
+                    session.query(PhoneInterval).delete()
+                    session.commit()
                 trainer.train_pronunciation_probabilities()
             else:
                 trainer.train()
@@ -543,7 +639,7 @@ class TrainableAligner(TranscriberMixin, TopLevelMfaWorker, ModelExporterMixin):
         new_phone_lm_path = os.path.join(previous.working_directory, "phone_lm.fst")
         if not os.path.exists(new_phone_lm_path) and os.path.exists(phone_lm_path):
             shutil.copyfile(phone_lm_path, new_phone_lm_path)
-        logger.info(f"Completed training in {time.time()-begin} seconds!")
+        logger.info(f"Completed training in {time.time() - begin} seconds!")
 
     def transition_acc_arguments(self) -> List[TransitionAccArguments]:
         """
@@ -558,7 +654,7 @@ class TrainableAligner(TranscriberMixin, TopLevelMfaWorker, ModelExporterMixin):
         return [
             TransitionAccArguments(
                 j.id,
-                getattr(self, "session", ""),
+                getattr(self, "session" if config.USE_THREADING else "db_string", ""),
                 self.working_log_directory.joinpath(f"test_utterances.{j.id}.log"),
                 self.working_directory,
                 self.model_path,
@@ -570,7 +666,9 @@ class TrainableAligner(TranscriberMixin, TopLevelMfaWorker, ModelExporterMixin):
         """
         Calculate the counts of pdfs corresponding to phones
         """
-
+        phone_pdf_counts_path = self.working_directory.joinpath("phone_pdf.counts")
+        if phone_pdf_counts_path.exists():
+            return
         logger.info("Accumulating transition stats...")
 
         begin = time.time()
@@ -579,10 +677,11 @@ class TrainableAligner(TranscriberMixin, TopLevelMfaWorker, ModelExporterMixin):
         arguments = self.transition_acc_arguments()
         transition_model, acoustic_model = read_gmm_model(self.model_path)
         transition_accs = DoubleVector(transition_model.NumTransitionIds() + 1)
-        with tqdm(total=self.num_utterances, disable=config.QUIET) as pbar:
-            for result in run_kaldi_function(TransitionAccFunction, arguments, pbar.update):
-                if not isinstance(result, int):
-                    transition_accs.AddVec(1.0, result)
+        for result in run_kaldi_function(
+            TransitionAccFunction, arguments, total_count=self.num_utterances
+        ):
+            if not isinstance(result, int):
+                transition_accs.AddVec(1.0, result)
         smoothing = 1
         phone_pdf_mapping = collections.defaultdict(collections.Counter)
         for tid in range(1, transition_model.NumTransitionIds() + 1):
@@ -591,14 +690,19 @@ class TrainableAligner(TranscriberMixin, TopLevelMfaWorker, ModelExporterMixin):
             phone = self.reversed_phone_mapping[phone_id]
             t_count = smoothing + float(transition_accs[tid])
             phone_pdf_mapping[phone][pdf_id] += t_count
-        with mfa_open(self.working_directory.joinpath("phone_pdf.counts"), "w") as f:
+        with mfa_open(phone_pdf_counts_path, "w") as f:
             json.dump(phone_pdf_mapping, f, ensure_ascii=False)
         logger.debug(f"Accumulating transition stats took {time.time() - begin:.3f} seconds")
         logger.info("Finished accumulating transition stats!")
 
     def finalize_training(self):
+        with self.session() as session:
+            session.query(WordInterval).delete()
+            session.query(PhoneInterval).delete()
+            session.commit()
         self.compute_phone_pdf_counts()
         self.collect_alignments()
+        self.analyze_alignments()
         self.train_phone_lm()
 
     def export_files(
@@ -620,7 +724,6 @@ class TrainableAligner(TranscriberMixin, TopLevelMfaWorker, ModelExporterMixin):
             Flag for including the original text of the corpus files as a tier
         """
         self.align()
-        self.analyze_alignments()
         super(TrainableAligner, self).export_files(
             output_directory, output_format, include_original_text
         )
@@ -636,8 +739,10 @@ class TrainableAligner(TranscriberMixin, TopLevelMfaWorker, ModelExporterMixin):
     def align_options(self) -> MetaDict:
         """Alignment options"""
         if self.current_aligner is not None:
-            return self.current_aligner.align_options
-        return super().align_options
+            options = self.current_aligner.align_options
+        else:
+            options = super().align_options
+        return options
 
     def align(self) -> None:
         """
@@ -662,7 +767,6 @@ class TrainableAligner(TranscriberMixin, TopLevelMfaWorker, ModelExporterMixin):
             self.current_acoustic_model.export_model(self.working_directory)
             self.uses_speaker_adaptation = False
             if self.current_acoustic_model.meta["features"]["uses_speaker_adaptation"]:
-
                 self.uses_speaker_adaptation = False
                 for j in self.jobs:
                     for path in j.construct_path_dictionary(

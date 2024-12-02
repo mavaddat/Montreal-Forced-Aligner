@@ -65,13 +65,14 @@ class TextCorpusMixin(CorpusMixin):
             file_count = 0
             with tqdm(total=1, disable=config.QUIET) as pbar, self.session() as session:
                 for root, _, files in os.walk(self.corpus_directory, followlinks=True):
+                    if self.stopped.is_set():
+                        break
+                    if root.startswith("."):  # Ignore hidden directories
+                        continue
                     exts = find_exts(files)
                     relative_path = (
                         root.replace(str(self.corpus_directory), "").lstrip("/").lstrip("\\")
                     )
-
-                    if self.stopped.is_set():
-                        break
                     for file_name in exts.identifiers:
                         if self.stopped.is_set():
                             break
@@ -160,7 +161,6 @@ class TextCorpusMixin(CorpusMixin):
                     else:
                         break
         finally:
-
             finished_adding.set()
             for p in procs:
                 p.join()
@@ -182,14 +182,15 @@ class TextCorpusMixin(CorpusMixin):
         sanitize_function = getattr(self, "sanitize_function", None)
         with self.session() as session:
             for root, _, files in os.walk(self.corpus_directory, followlinks=True):
+                if self.stopped:
+                    return
+                if root.startswith("."):  # Ignore hidden directories
+                    continue
                 exts = find_exts(files)
                 relative_path = (
                     root.replace(str(self.corpus_directory), "").lstrip("/").lstrip("\\")
                 )
-                if self.stopped:
-                    return
                 for file_name in exts.identifiers:
-
                     wav_path = None
                     if file_name in exts.lab_files:
                         lab_name = exts.lab_files[file_name]
@@ -257,12 +258,15 @@ class DictionaryTextCorpusMixin(TextCorpusMixin, MultispeakerDictionaryMixin):
         Load the corpus
         """
         self.initialize_database()
-        self.dictionary_setup()
+        if not self.imported:
+            self.dictionary_setup()
 
         self._load_corpus()
         self.initialize_jobs()
+        initialized_check = self.text_normalized
         self.normalize_text()
-        self.write_lexicon_information()
+        if not initialized_check:
+            self.write_lexicon_information()
         self.create_corpus_split()
 
 

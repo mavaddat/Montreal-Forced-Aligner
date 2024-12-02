@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import atexit
 import logging
-import re
 import sys
 import time
 import warnings
@@ -33,7 +32,11 @@ from montreal_forced_aligner.command_line.train_g2p import train_g2p_cli
 from montreal_forced_aligner.command_line.train_ivector_extractor import train_ivector_cli
 from montreal_forced_aligner.command_line.train_lm import train_lm_cli
 from montreal_forced_aligner.command_line.train_tokenizer import train_tokenizer_cli
-from montreal_forced_aligner.command_line.transcribe import transcribe_corpus_cli
+from montreal_forced_aligner.command_line.transcribe import (
+    transcribe_corpus_cli,
+    transcribe_speechbrain_cli,
+    transcribe_whisper_cli,
+)
 from montreal_forced_aligner.command_line.validate import (
     validate_corpus_cli,
     validate_dictionary_cli,
@@ -118,17 +121,6 @@ def mfa_cli(ctx: click.Context) -> None:
     """
     from montreal_forced_aligner.command_line.utils import check_server, start_server, stop_server
 
-    try:
-        from montreal_forced_aligner._version import version
-
-        if re.search(r"\d+\.\d+\.\d+a", version) is not None:
-            print(
-                "Please be aware that you are running an alpha version of MFA. If you would like to install a more "
-                "stable version, please visit https://montreal-forced-aligner.readthedocs.io/en/latest/installation.html#installing-older-versions-of-mfa",
-                file=sys.stderr,
-            )
-    except ImportError:
-        pass
     config.load_configuration()
     auto_server = False
     run_check = True
@@ -182,7 +174,7 @@ def version_cli():
         from montreal_forced_aligner._version import version
     except ImportError:
         version = None
-    print(version)
+    click.echo(version)
 
 
 mfa_cli.add_command(adapt_model_cli)
@@ -206,6 +198,8 @@ mfa_cli.add_command(train_ivector_cli)
 mfa_cli.add_command(train_lm_cli)
 mfa_cli.add_command(train_tokenizer_cli)
 mfa_cli.add_command(transcribe_corpus_cli)
+mfa_cli.add_command(transcribe_speechbrain_cli)
+mfa_cli.add_command(transcribe_whisper_cli)
 mfa_cli.add_command(validate_corpus_cli)
 mfa_cli.add_command(validate_dictionary_cli)
 mfa_cli.add_command(version_cli)

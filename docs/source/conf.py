@@ -79,6 +79,16 @@ xref_links = {
     "anchor": ("Anchor Annotator", "https://anchor-annotator.readthedocs.io/en/latest/"),
     "speechbrain": ("SpeechBrain", "https://speechbrain.github.io/"),
     "scikit-learn": ("scikit-learn", "https://scikit-learn.org/stable/index.html"),
+    "spacy-pkuseg": ("spacy-pkuseg", "https://github.com/explosion/spacy-pkuseg"),
+    "hanziconv": ("hanziconv", "https://github.com/berniey/hanziconv"),
+    "dragonmapper": ("dragonmapper", "https://github.com/tsroten/dragonmapper"),
+    "python-mecab-ko": ("python-mecab-ko", "https://github.com/jonghwanhyeon/python-mecab-ko"),
+    "jamo": ("jamo", "https://github.com/jdongian/python-jamo"),
+    "pythainlp": ("pythainlp", "https://pythainlp.github.io/"),
+    "sudachipy": (
+        "sudachipy",
+        "https://github.com/WorksApplications/sudachi.rs/tree/develop/python",
+    ),
     "click": ("click", "https://click.palletsprojects.com/en/8.1.x/"),
     "pgvector": ("pgvector", "https://github.com/pgvector/pgvector"),
     "pretrained_acoustic_models": (
@@ -115,7 +125,6 @@ xref_links = {
         "https://github.com/MontrealCorpusTools/Montreal-Forced-Aligner/issues",
     ),
     "memcauliffe.com": ("Michael McAuliffe's blog", "https://memcauliffe.com"),
-    "@wavable": ("@wavable", "https://twitter.com/wavable"),
     "@mmcauliffe.bsky.social": (
         "@mmcauliffe.bsky.social",
         "https://bsky.app/profile/mmcauliffe.bsky.social",
@@ -276,7 +285,7 @@ exclude_patterns = []
 # The reST default role (used for this markup: `text`) to use for all
 # documents.
 #
-default_role = "autolink"
+default_role = "code"
 
 # If true, '()' will be appended to :func: etc. cross-reference text.
 #

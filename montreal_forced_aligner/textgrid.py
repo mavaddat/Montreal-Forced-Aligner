@@ -13,19 +13,22 @@ import typing
 from pathlib import Path
 from typing import Dict, List
 
+import sqlalchemy
 from praatio import textgrid as tgio
 from praatio.data_classes.interval_tier import Interval
-from sqlalchemy.orm import Session, joinedload, selectinload
+from praatio.utilities import utils as tgio_utils
+from sqlalchemy.orm import Session
 
 from montreal_forced_aligner.data import (
     CtmInterval,
+    PhoneType,
     TextFileType,
     TextgridFormats,
     WordType,
-    WorkflowType,
 )
 from montreal_forced_aligner.db import (
     CorpusWorkflow,
+    Phone,
     PhoneInterval,
     Speaker,
     Utterance,
@@ -38,10 +41,124 @@ from montreal_forced_aligner.helper import mfa_open
 __all__ = [
     "process_ctm_line",
     "export_textgrid",
-    "construct_output_tiers",
+    "construct_textgrid_output",
     "construct_output_path",
     "output_textgrid_writing_errors",
 ]
+
+
+class Textgrid(tgio.Textgrid):
+    def save(
+        self,
+        fn: str,
+        format: typing.Literal["short_textgrid", "long_textgrid", "json", "textgrid_json"],
+        includeBlankSpaces: bool,
+        minTimestamp: typing.Optional[float] = None,
+        maxTimestamp: typing.Optional[float] = None,
+        minimumIntervalLength: float = None,
+        reportingMode: typing.Literal["silence", "warning", "error"] = "warning",
+    ) -> None:
+        """Save the current textgrid to a file
+
+        Args:
+            fn: the fullpath filename of the output
+            format: one of ['short_textgrid', 'long_textgrid', 'json', 'textgrid_json']
+                'short_textgrid' and 'long_textgrid' are both used by praat
+                'json' and 'textgrid_json' are two json variants. 'json' cannot represent
+                tiers with different min and max timestamps than the textgrid.
+            includeBlankSpaces: if True, blank sections in interval
+                tiers will be filled in with an empty interval
+                (with a label of ""). If you are unsure, True is recommended
+                as Praat needs blanks to render textgrids properly.
+            minTimestamp: the minTimestamp of the saved Textgrid;
+                if None, use whatever is defined in the Textgrid object.
+                If minTimestamp is larger than timestamps in your textgrid,
+                an exception will be thrown.
+            maxTimestamp: the maxTimestamp of the saved Textgrid;
+                if None, use whatever is defined in the Textgrid object.
+                If maxTimestamp is smaller than timestamps in your textgrid,
+                an exception will be thrown.
+            minimumIntervalLength: any labeled intervals smaller
+                than this will be removed, useful for removing ultrashort
+                or fragmented intervals; if None, don't remove any.
+                Removed intervals are merged (without their label) into
+                adjacent entries.
+            reportingMode: one of "silence", "warning", or "error". This flag
+                determines the behavior if there is a size difference between the
+                maxTimestamp in the tier and the current textgrid.
+
+        Returns:
+            a string representation of the textgrid
+        """
+
+        tab = " " * 4
+
+        with mfa_open(fn, mode="w") as fd:
+            if format in {TextgridFormats.LONG_TEXTGRID, TextgridFormats.SHORT_TEXTGRID}:
+                # Header
+                if format == TextgridFormats.LONG_TEXTGRID:
+                    fd.write('File type = "ooTextFile"\n')
+                    fd.write('Object class = "TextGrid"\n\n')
+
+                    fd.write(f"xmin = {self.minTimestamp} \n")
+                    fd.write(f"xmax = {self.maxTimestamp} \n")
+                    fd.write("tiers? <exists> \n")
+                    fd.write(f"size = {len(self._tierDict)} \n")
+                    fd.write("item []: \n")
+                elif format == TextgridFormats.SHORT_TEXTGRID:
+                    fd.write('File type = "ooTextFile"\n')
+                    fd.write('Object class = "TextGrid"\n\n')
+                    fd.write(f"{self.minTimestamp}\n{self.maxTimestamp}\n")
+                    fd.write(f"<exists>\n{len(self._tierDict)}\n")
+
+                for tierNum, (name, tier) in enumerate(self._tierDict.items()):
+                    if includeBlankSpaces and tier._entries:
+                        if tier._entries[0][0] > 0.001:
+                            tier._entries.insert(0, Interval(0.0, tier._entries[0][0], ""))
+                        interval_index = 1
+                        while interval_index < len(tier._entries):
+                            start, end, label = tier._entries[interval_index]
+                            previous_entry = tier._entries[interval_index - 1]
+                            if start - previous_entry[1] > 0.001:
+                                tier._entries.insert(
+                                    interval_index, Interval(previous_entry[1], start, "")
+                                )
+                                interval_index += 1
+                            interval_index += 1
+                        if self.maxTimestamp - tier._entries[-1][1] > 0.001:
+                            tier._entries.append(
+                                Interval(tier._entries[-1][1], self.maxTimestamp, "")
+                            )
+
+                    tier_name = tgio_utils.escapeQuotes(name)
+                    if format == TextgridFormats.LONG_TEXTGRID:
+                        # Interval header
+                        fd.write(tab + f"item [{tierNum + 1}]:\n")
+                        fd.write(tab * 2 + f'class = "{tier.tierType}" \n')
+                        fd.write(tab * 2 + f'name = "{tier_name}" \n')
+                        fd.write(tab * 2 + f"xmin = {self.minTimestamp} \n")
+                        fd.write(tab * 2 + f"xmax = {self.maxTimestamp} \n")
+
+                        fd.write(tab * 2 + f"intervals: size = {len(tier._entries)} \n")
+                    elif format == TextgridFormats.SHORT_TEXTGRID:
+                        fd.write(f'"{tier.tierType}"\n')
+                        fd.write(f'"{tier_name}"\n')
+                        fd.write(
+                            f"{self.minTimestamp}\n{self.maxTimestamp}\n{len(tier._entries)}\n"
+                        )
+
+                    for i, entry in enumerate(tier._entries):
+                        start, end, label = entry
+                        label = tgio_utils.escapeQuotes(label)
+                        if format == TextgridFormats.LONG_TEXTGRID:
+                            fd.write(
+                                f"{tab * 2}intervals [{i + 1}]:\n"
+                                f"{tab * 3}xmin = {start} \n"
+                                f"{tab * 3}xmax = {end} \n"
+                                f'{tab * 3}text = "{label}" \n'
+                            )
+                        elif format == TextgridFormats.SHORT_TEXTGRID:
+                            fd.write(f'{start}\n{end}\n"{label}"\n')
 
 
 def process_ctm_line(
@@ -159,93 +276,151 @@ def parse_aligned_textgrid(
     return data
 
 
-def construct_output_tiers(
+def construct_textgrid_output(
     session: Session,
-    file_id: int,
+    file_batch: typing.Dict[int, typing.Tuple],
     workflow: CorpusWorkflow,
     cleanup_textgrids: bool,
     clitic_marker: str,
-    include_original_text: bool,
-) -> Dict[str, Dict[str, List[CtmInterval]]]:
-    """
-    Construct aligned output tiers for a file
-
-    Parameters
-    ----------
-    session: Session
-        SqlAlchemy session
-    file_id: int
-        Integer ID for the file
-
-    Returns
-    -------
-    Dict[str, Dict[str,List[CtmInterval]]]
-        Aligned tiers
-    """
-    utterances = (
-        session.query(Utterance)
-        .options(
-            joinedload(Utterance.speaker, innerjoin=True).load_only(Speaker.name),
+    output_directory: Path,
+    frame_shift: float,
+    output_format: str = TextgridFormats.SHORT_TEXTGRID,
+    include_original_text: bool = False,
+):
+    phone_interval_query = (
+        sqlalchemy.select(
+            PhoneInterval.begin, PhoneInterval.end, Phone.phone, Speaker.name, Utterance.file_id
         )
-        .filter(Utterance.file_id == file_id)
+        .execution_options(yield_per=1000)
+        .join(PhoneInterval.phone)
+        .join(PhoneInterval.utterance)
+        .join(Utterance.speaker)
+        .filter(PhoneInterval.workflow_id == workflow.id)
+        .filter(PhoneInterval.duration > 0)
+        .filter(Utterance.file_id.in_(list(file_batch.keys())))
     )
-    data = {}
-    for utt in utterances:
-        word_intervals = (
-            session.query(WordInterval, Word)
-            .join(WordInterval.word)
-            .filter(WordInterval.utterance_id == utt.id)
-            .filter(WordInterval.workflow_id == workflow.id)
-            .options(
-                selectinload(WordInterval.phone_intervals).joinedload(
-                    PhoneInterval.phone, innerjoin=True
-                )
-            )
-            .order_by(WordInterval.begin)
+    word_interval_query = (
+        sqlalchemy.select(
+            WordInterval.begin, WordInterval.end, Word.word, Speaker.name, Utterance.file_id
         )
-        if cleanup_textgrids:
-            word_intervals = word_intervals.filter(Word.word_type != WordType.silence)
-        if utt.speaker.name not in data:
-            data[utt.speaker.name] = {"words": [], "phones": []}
-            if include_original_text:
-                data[utt.speaker.name]["utterances"] = []
-        actual_words = utt.normalized_text.split()
-        if include_original_text:
-            data[utt.speaker.name]["utterances"].append(CtmInterval(utt.begin, utt.end, utt.text))
-        for i, (wi, w) in enumerate(word_intervals.all()):
-            if len(wi.phone_intervals) == 0:
-                continue
-            label = w.word
-            if cleanup_textgrids:
-                if (
-                    w.word_type is WordType.oov
-                    and workflow.workflow_type is WorkflowType.alignment
-                ):
-                    label = actual_words[i]
-                if (
-                    data[utt.speaker.name]["words"]
-                    and clitic_marker
-                    and (
-                        data[utt.speaker.name]["words"][-1].label.endswith(clitic_marker)
-                        or label.startswith(clitic_marker)
-                    )
-                ):
-                    data[utt.speaker.name]["words"][-1].end = wi.end
-                    data[utt.speaker.name]["words"][-1].label += label
+        .execution_options(yield_per=1000)
+        .join(WordInterval.word)
+        .join(WordInterval.utterance)
+        .join(Utterance.speaker)
+        .filter(WordInterval.workflow_id == workflow.id)
+        .filter(WordInterval.duration > 0)
+        .filter(Utterance.file_id.in_(list(file_batch.keys())))
+    )
+    if cleanup_textgrids:
+        phone_interval_query = phone_interval_query.filter(Phone.phone_type != PhoneType.silence)
+        word_interval_query = word_interval_query.filter(Word.word_type != WordType.silence)
+    phone_intervals = session.execute(
+        phone_interval_query.order_by(Utterance.file_id, PhoneInterval.begin)
+    )
+    word_intervals = session.execute(
+        word_interval_query.order_by(Utterance.file_id, WordInterval.begin)
+    )
+    utterances = None
+    if include_original_text:
+        utterances = session.execute(
+            sqlalchemy.select(
+                Utterance.begin, Utterance.end, Utterance.text, Speaker.name, Utterance.file_id
+            )
+            .execution_options(yield_per=1000)
+            .join(Utterance.speaker)
+            .filter(Utterance.file_id.in_(list(file_batch.keys())))
+            .order_by(Utterance.file_id)
+        )
+    pi_current_file_id = None
+    wi_current_file_id = None
+    u_current_file_id = None
+    word_data = []
+    phone_data = []
+    utterance_data = []
 
-                    for pi in sorted(wi.phone_intervals, key=lambda x: x.begin):
-                        data[utt.speaker.name]["phones"].append(
-                            CtmInterval(pi.begin, pi.end, pi.phone.phone)
-                        )
-                    continue
+    def process_phone_data():
+        for beg, end, p, speaker_name in phone_data:
+            if speaker_name not in data:
+                data[speaker_name] = {"words": [], "phones": []}
+                if include_original_text:
+                    data[speaker_name]["utterances"] = []
+            data[speaker_name]["phones"].append(CtmInterval(beg, end, p))
 
-            data[utt.speaker.name]["words"].append(CtmInterval(wi.begin, wi.end, label))
-
-            for pi in wi.phone_intervals:
-                data[utt.speaker.name]["phones"].append(
-                    CtmInterval(pi.begin, pi.end, pi.phone.phone)
+    def process_word_data():
+        for beg, end, w, speaker_name in word_data:
+            if (
+                cleanup_textgrids
+                and data[speaker_name]["words"]
+                and beg - data[speaker_name]["words"][-1].end < 0.02
+                and clitic_marker
+                and (
+                    data[speaker_name]["words"][-1].label.endswith(clitic_marker)
+                    or w.startswith(clitic_marker)
                 )
-    return data
+            ):
+                data[speaker_name]["words"][-1].end = end
+                data[speaker_name]["words"][-1].label += w
+            else:
+                data[speaker_name]["words"].append(CtmInterval(beg, end, w))
+
+    def process_utterance_data():
+        for beg, end, u, speaker_name in utterance_data:
+            data[speaker_name]["utterances"].append(CtmInterval(beg, end, u))
+
+    while True:
+        data = {}
+        for pi_begin, pi_end, phone, pi_speaker_name, pi_file_id in phone_intervals:
+            if pi_current_file_id is None:
+                pi_current_file_id = pi_file_id
+            if pi_file_id != pi_current_file_id:
+                process_phone_data()
+                phone_data = [(pi_begin, pi_end, phone, pi_speaker_name)]
+                current_file_id = pi_current_file_id
+                pi_current_file_id = pi_file_id
+                break
+            phone_data.append((pi_begin, pi_end, phone, pi_speaker_name))
+        else:
+            if phone_data:
+                process_phone_data()
+                current_file_id = pi_current_file_id
+                phone_data = []
+            else:
+                break
+        for wi_begin, wi_end, word, wi_speaker_name, wi_file_id in word_intervals:
+            if wi_current_file_id is None:
+                wi_current_file_id = wi_file_id
+            if wi_file_id != wi_current_file_id:
+                process_word_data()
+                word_data = [(wi_begin, wi_end, word, wi_speaker_name)]
+                wi_current_file_id = wi_file_id
+                break
+            word_data.append((wi_begin, wi_end, word, wi_speaker_name))
+        else:
+            if word_data:
+                process_word_data()
+        if include_original_text:
+            for u_begin, u_end, text, u_speaker_name, u_file_id in utterances:
+                if u_current_file_id is None:
+                    u_current_file_id = u_file_id
+                if u_file_id != u_current_file_id:
+                    process_utterance_data()
+                    utterance_data = [(u_begin, u_end, text, u_speaker_name)]
+                    u_current_file_id = u_file_id
+                    break
+                utterance_data.append((u_begin, u_end, text, u_speaker_name))
+            else:
+                if utterance_data:
+                    process_utterance_data()
+
+        file_name, relative_path, file_duration, text_file_path = file_batch[current_file_id]
+        output_path = construct_output_path(
+            file_name, relative_path, output_directory, text_file_path, output_format
+        )
+        export_textgrid(data, output_path, file_duration, frame_shift, output_format)
+        yield output_path
+        # word_data = []
+        # phone_data = []
+        # utterance_data = []
 
 
 def construct_output_path(
@@ -355,7 +530,7 @@ def export_textgrid(
                 json.dump(json_data, f, indent=4, ensure_ascii=False)
     else:
         # Create initial textgrid
-        tg = tgio.Textgrid()
+        tg = Textgrid()
         tg.minTimestamp = 0
         tg.maxTimestamp = duration
         for speaker, data in speaker_data.items():
@@ -374,19 +549,24 @@ def export_textgrid(
                         frame_shift * 2
                     ):  # Fix rounding issues
                         a.end = duration
-                    if i > 0 and tier.entries[-1].end > a.to_tg_interval().start:
-                        a.begin = tier.entries[-1].end
-                    tier.insertEntry(a.to_tg_interval(duration))
+                    tg_interval = a.to_tg_interval()
+                    if i > 0 and tier._entries[-1].end > tg_interval.start:
+                        a.begin = tier._entries[-1].end
+                        tg_interval = a.to_tg_interval()
+                    tier._entries.append(tg_interval)
         if has_data:
             for tier in tg.tiers:
-                if len(tier.entries) > 0 and tier.entries[-1][1] > tg.maxTimestamp:
+                if len(tier._entries) > 0 and tier._entries[-1][1] > tg.maxTimestamp:
                     tier.insertEntry(
-                        Interval(tier.entries[-1].start, tg.maxTimestamp, tier.entries[-1].label),
+                        Interval(
+                            tier._entries[-1].start, tg.maxTimestamp, tier._entries[-1].label
+                        ),
                         collisionMode="replace",
                     )
             tg.save(
                 str(output_path),
                 includeBlankSpaces=True,
                 format=output_format,
-                reportingMode="error",
+                minimumIntervalLength=None,
+                reportingMode="silence",
             )

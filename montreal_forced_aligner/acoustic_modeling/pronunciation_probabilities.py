@@ -10,12 +10,9 @@ from pathlib import Path
 
 import pynini
 import pywrapfst
-from _kalpy.fstext import fst_determinize_star, fst_minimize_encoded, fst_push_special
 from kalpy.fstext.lexicon import G2PCompiler
-from kalpy.fstext.utils import kaldi_to_pynini, pynini_to_kaldi
 from kalpy.gmm.align import GmmAligner
 from sqlalchemy.orm import joinedload
-from tqdm.rich import tqdm
 
 from montreal_forced_aligner import config
 from montreal_forced_aligner.acoustic_modeling.base import AcousticModelTrainingMixin
@@ -138,14 +135,17 @@ class PronunciationProbabilityTrainer(AcousticModelTrainingMixin, PyniniTrainerM
         aligner = GmmAligner(
             self.model_path, disambiguation_symbols=disambiguation_symbols, **align_options
         )
+        lexicon_compilers = {}
+        if getattr(self, "use_g2p", False):
+            lexicon_compilers = getattr(self, "lexicon_compilers", {})
 
         return [
             GeneratePronunciationsArguments(
                 j.id,
-                getattr(self, "session", ""),
+                getattr(self, "session" if config.USE_THREADING else "db_string", ""),
                 self.working_log_directory.joinpath(f"generate_pronunciations.{j.id}.log"),
                 aligner,
-                self.lexicon_compilers,
+                lexicon_compilers,
                 True,
             )
             for j in self.jobs
@@ -201,19 +201,18 @@ class PronunciationProbabilityTrainer(AcousticModelTrainingMixin, PyniniTrainerM
                 )
                 for x in self.worker.dictionary_lookup.values()
             }
-            with tqdm(total=self.num_current_utterances, disable=config.QUIET) as pbar:
-                for dict_id, utt_id, phones in run_kaldi_function(
-                    GeneratePronunciationsFunction, arguments, pbar.update
-                ):
-                    if utt_id not in texts or not texts[utt_id]:
-                        continue
+            for dict_id, utt_id, phones in run_kaldi_function(
+                GeneratePronunciationsFunction, arguments, total_count=self.num_current_utterances
+            ):
+                if utt_id not in texts or not texts[utt_id]:
+                    continue
 
-                    print(phones, file=output_alignment_files[dict_id])
-                    print(
-                        re.sub(r"\s+", " ", phones.replace("#1", "").replace("#2", "")).strip(),
-                        file=output_files[dict_id],
-                    )
-                    print(texts[utt_id], file=input_files[dict_id])
+                print(phones, file=output_alignment_files[dict_id])
+                print(
+                    re.sub(r"\s+", " ", phones.replace("#1", "").replace("#2", "")).strip(),
+                    file=output_files[dict_id],
+                )
+                print(texts[utt_id], file=input_files[dict_id])
             for f in input_files.values():
                 f.close()
             for f in output_files.values():
@@ -294,34 +293,6 @@ class PronunciationProbabilityTrainer(AcousticModelTrainingMixin, PyniniTrainerM
                     align_fst=align_fst,
                     silence_phone=self.optional_silence_phone,
                 )
-                if config.DEBUG and False:
-                    fst = pynini.Fst.read(d.lexicon_fst_path)
-                    grapheme_table = pywrapfst.SymbolTable.read_text(
-                        self.grapheme_symbol_table_path
-                    )
-                    phone_table = pywrapfst.SymbolTable.read_text(self.phone_symbol_table_path)
-                    query = session.query(Utterance.kaldi_id, Utterance.normalized_character_text)
-                    for utt_id, text in query:
-                        in_fst = pynini.accep(text, token_type=grapheme_table)
-                        logger.debug(f"{utt_id}: {text}")
-                        lg_fst = pynini.compose(in_fst, fst, compose_filter="alt_sequence")
-                        lg_fst = lg_fst.project("output").rmepsilon()
-                        weight_type = lg_fst.weight_type()
-                        weight_threshold = pywrapfst.Weight(weight_type, 2.0)
-                        state_threshold = 256 + 2 * lg_fst.num_states()
-                        lg_fst = pynini.determinize(
-                            lg_fst, nstate=state_threshold, weight=weight_threshold
-                        )
-
-                        lg_fst = pynini_to_kaldi(lg_fst)
-                        fst_determinize_star(lg_fst, use_log=True)
-                        fst_minimize_encoded(lg_fst)
-                        fst_push_special(lg_fst)
-                        lg_fst = kaldi_to_pynini(lg_fst)
-                        path_string = (
-                            pynini.shortestpath(lg_fst).project("output").string(phone_table)
-                        )
-                        logger.debug(f"Output: {path_string}")
             session.commit()
             self.worker.use_g2p = True
 
@@ -341,8 +312,12 @@ class PronunciationProbabilityTrainer(AcousticModelTrainingMixin, PyniniTrainerM
         previous_directory = self.previous_aligner.working_directory
         for j in self.jobs:
             for p in j.construct_path_dictionary(previous_directory, "ali", "ark").values():
+                if not p.exists():
+                    continue
                 shutil.copy(p, wf.working_directory.joinpath(p.name))
             for p in j.construct_path_dictionary(previous_directory, "words", "ark").values():
+                if not p.exists():
+                    continue
                 shutil.copy(p, wf.working_directory.joinpath(p.name))
         for f in ["final.mdl", "final.alimdl", "lda.mat", "tree"]:
             p = previous_directory.joinpath(f)
@@ -377,12 +352,8 @@ class PronunciationProbabilityTrainer(AcousticModelTrainingMixin, PyniniTrainerM
                 return
 
             silence_prob_sum = 0
-            initial_silence_prob_sum = 0
-            final_silence_correction_sum = 0
-            final_non_silence_correction_sum = 0
 
             with self.worker.session() as session:
-
                 dictionaries = session.query(Dictionary).all()
                 for d in dictionaries:
                     pronunciations = (
@@ -414,27 +385,33 @@ class PronunciationProbabilityTrainer(AcousticModelTrainingMixin, PyniniTrainerM
                     )
                     with mfa_open(silence_info_path, "r") as f:
                         data = json.load(f)
+                        for k, v in data.items():
+                            if v is None:
+                                if "correction" in k:
+                                    data[k] = 1.0
+                                else:
+                                    data[k] = 0.5
                     if self.silence_probabilities:
                         d.silence_probability = data["silence_probability"]
-                        d.initial_silence_probability = data["initial_silence_probability"]
-                        d.final_silence_correction = data["final_silence_correction"]
-                        d.final_non_silence_correction = data["final_non_silence_correction"]
+                        # d.initial_silence_probability = data["initial_silence_probability"]
+                        # d.final_silence_correction = data["final_silence_correction"]
+                        # d.final_non_silence_correction = data["final_non_silence_correction"]
                         silence_prob_sum += d.silence_probability
-                        initial_silence_prob_sum += d.initial_silence_probability
-                        final_silence_correction_sum += d.final_silence_correction
-                        final_non_silence_correction_sum += d.final_non_silence_correction
+                        # initial_silence_prob_sum += d.initial_silence_probability
+                        # final_silence_correction_sum += d.final_silence_correction
+                        # final_non_silence_correction_sum += d.final_non_silence_correction
 
                 if self.silence_probabilities:
                     self.worker.silence_probability = silence_prob_sum / len(dictionaries)
-                    self.worker.initial_silence_probability = initial_silence_prob_sum / len(
-                        dictionaries
-                    )
-                    self.worker.final_silence_correction = final_silence_correction_sum / len(
-                        dictionaries
-                    )
-                    self.worker.final_non_silence_correction = (
-                        final_non_silence_correction_sum / len(dictionaries)
-                    )
+                    # self.worker.initial_silence_probability = initial_silence_prob_sum / len(
+                    #    dictionaries
+                    # )
+                    # self.worker.final_silence_correction = final_silence_correction_sum / len(
+                    #    dictionaries
+                    # )
+                    # self.worker.final_non_silence_correction = (
+                    #    final_non_silence_correction_sum / len(dictionaries)
+                    # )
                 session.commit()
             self.worker.write_lexicon_information()
             return

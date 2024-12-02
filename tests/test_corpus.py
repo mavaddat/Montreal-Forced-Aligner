@@ -1,5 +1,6 @@
 import os
 import shutil
+import unicodedata
 
 from montreal_forced_aligner import config
 from montreal_forced_aligner.corpus.acoustic_corpus import (
@@ -138,7 +139,6 @@ def test_extra(basic_dict_path, extra_corpus_dir, generated_dir, db_setup):
 
 
 def test_stereo(basic_dict_path, stereo_corpus_dir, generated_dir, db_setup):
-
     output_directory = generated_dir.joinpath("corpus_tests", "stereo")
     if os.path.exists(output_directory):
         shutil.rmtree(output_directory, ignore_errors=True)
@@ -264,6 +264,7 @@ def test_24bit_wav(transcribe_corpus_24bit_dir, basic_dict_path, generated_dir, 
     corpus = AcousticCorpus(
         corpus_directory=transcribe_corpus_24bit_dir,
     )
+    corpus.transcriptions_required = False
     corpus.load_corpus()
     assert len(corpus.no_transcription_files) == 2
     assert corpus.get_feat_dim() == 39
@@ -596,8 +597,8 @@ def test_japanese(japanese_dir, japanese_dict_path, generated_dir, db_setup):
     print(corpus.utterances())
 
     punctuated = corpus.get_utterances(file="日本語")[0]
-    assert punctuated.text == "「はい」、。！ 『何 でしょう』"
-    assert punctuated.normalized_text == "はい 何 でしょう"
+    assert punctuated.text == unicodedata.normalize("NFKC", "「はい」、。！ 『何 でしょう』")
+    assert punctuated.normalized_text == unicodedata.normalize("NFKC", "はい 何 でしょう")
     corpus.cleanup_connections()
 
 
@@ -613,8 +614,8 @@ def test_devanagari(devanagari_dir, hindi_dict_path, generated_dir, db_setup):
     print(corpus.utterances())
 
     punctuated = corpus.get_utterances(file="devanagari")[0]
-    assert punctuated.text == "हैंः हूं हौंसला"
-    assert punctuated.normalized_text == "हैंः हूं हौंसला"
+    assert punctuated.text == unicodedata.normalize("NFKC", "हैंः हूं हौंसला")
+    assert punctuated.normalized_text == unicodedata.normalize("NFKC", "हैंः हूं हौंसला")
     corpus.cleanup_connections()
 
 
@@ -630,12 +631,12 @@ def test_french_clitics(french_clitics_dir, frclitics_dict_path, generated_dir, 
     corpus.load_corpus()
 
     punctuated = corpus.get_utterances(file="french_clitics")[0]
-    assert (
-        punctuated.text
-        == "aujourd aujourd'hui m'appelle purple-people-eater vingt-six m'm'appelle c'est m'c'est m'appele m'ving-sic flying'purple-people-eater"
+    assert punctuated.text == unicodedata.normalize(
+        "NFKC",
+        "aujourd aujourd'hui m'appelle purple-people-eater vingt-six m'm'appelle c'est m'c'est m'appele m'ving-sic flying'purple-people-eater",
     )
-    assert (
-        punctuated.normalized_text
-        == "aujourd aujourd'hui m' appelle purple-people-eater vingt six m' m' appelle c'est m' c'est m' appele m' ving sic flying'purple-people-eater"
+    assert punctuated.normalized_text == unicodedata.normalize(
+        "NFKC",
+        "aujourd aujourd'hui m' appelle purple-people-eater vingt six m' m' appelle c'est m' c'est m' appele m' ving sic flying'purple-people-eater",
     )
     corpus.cleanup_connections()

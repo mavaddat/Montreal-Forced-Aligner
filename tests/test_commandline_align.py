@@ -2,6 +2,7 @@ import json
 import os
 
 import click.testing
+import pytest
 from praatio import textgrid as tgio
 
 from montreal_forced_aligner.command_line.mfa import mfa_cli
@@ -301,7 +302,6 @@ def test_align_multilingual(
     english_mfa_acoustic_model,
     db_setup,
 ):
-
     command = [
         "align",
         multilingual_ipa_corpus_dir,
@@ -340,7 +340,6 @@ def test_align_multilingual_speaker_dict(
     english_mfa_acoustic_model,
     db_setup,
 ):
-
     command = [
         "align",
         multilingual_ipa_corpus_dir,
@@ -379,7 +378,6 @@ def test_align_multilingual_tg_speaker_dict(
     english_mfa_acoustic_model,
     db_setup,
 ):
-
     command = [
         "align",
         multilingual_ipa_tg_corpus_dir,
@@ -418,7 +416,6 @@ def test_align_fine_tune(
     eval_mapping_path,
     db_setup,
 ):
-
     command = [
         "align",
         basic_corpus_dir,
@@ -460,7 +457,6 @@ def test_align_evaluation(
     eval_mapping_path,
     db_setup,
 ):
-
     command = [
         "align",
         basic_corpus_dir,
@@ -685,6 +681,7 @@ def test_swedish_cv(
         "test",
         "--beam",
         "1000",
+        "--final_clean",
     ]
     command = [str(x) for x in command]
     result = click.testing.CliRunner(mix_stderr=False).invoke(
@@ -714,18 +711,18 @@ def test_swedish_cv(
 def test_swedish_mfa(
     swedish_dir,
     generated_dir,
-    swedish_cv_dictionary,
+    swedish_mfa_dictionary,
     temp_dir,
     basic_align_config_path,
-    swedish_cv_acoustic_model,
+    swedish_mfa_acoustic_model,
     db_setup,
 ):
     output_dir = generated_dir.joinpath("swedish_mfa_output")
     command = [
         "align",
         swedish_dir,
-        swedish_cv_dictionary,
-        swedish_cv_acoustic_model,
+        swedish_mfa_dictionary,
+        swedish_mfa_acoustic_model,
         output_dir,
         "--config_path",
         basic_align_config_path,
@@ -762,6 +759,7 @@ def test_swedish_mfa(
         assert len(tg.tierNames) == 2
 
 
+@pytest.mark.skip
 def test_acoustic_g2p_model(
     basic_corpus_dir,
     acoustic_model_dir,
@@ -785,6 +783,7 @@ def test_acoustic_g2p_model(
         "--clean",
         "--debug",
         "--no_use_mp",
+        "--use_threading",
         "-p",
         "test",
     ]

@@ -36,8 +36,8 @@ class TrainSpeakerLmArguments(MfaArguments):
     ----------
     job_name: int
         Integer ID of the job
-    db_string: str
-        String for database connections
+    session: :class:`sqlalchemy.orm.scoped_session` or str
+        SqlAlchemy scoped session or string for database connections
     log_path: :class:`~pathlib.Path`
         Path to save logging information during the run
     model_path: :class:`~pathlib.Path`
@@ -70,16 +70,18 @@ class TrainLmArguments(MfaArguments):
     ----------
     job_name: int
         Integer ID of the job
-    db_string: str
-        String for database connections
+    session: :class:`sqlalchemy.orm.scoped_session` or str
+        SqlAlchemy scoped session or string for database connections
     log_path: :class:`~pathlib.Path`
         Path to save logging information during the run
+    working_directory: :class:`~pathlib.Path`
+        Working directory
     symbols_path: :class:`~pathlib.Path`
         Words symbol table paths
-    oov_word: str
-        OOV word
     order: int
         Ngram order of the language models
+    oov_word: str
+        OOV word
     """
 
     working_directory: Path
@@ -116,7 +118,7 @@ class TrainLmFunction(KaldiFunction):
         self.order = args.order
         self.oov_word = args.oov_word
 
-    def _run(self) -> typing.Generator[bool]:
+    def _run(self) -> None:
         """Run the function"""
         with self.session() as session, mfa_open(self.log_path, "w") as log_file:
             word_query = session.query(Word.word).filter(
@@ -130,6 +132,7 @@ class TrainLmFunction(KaldiFunction):
             farcompile_proc = subprocess.Popen(
                 [
                     thirdparty_binary("farcompilestrings"),
+                    "--fst_type=compact",
                     "--token_type=symbol",
                     "--generate_keys=16",
                     "--keep_symbols",
@@ -152,7 +155,7 @@ class TrainLmFunction(KaldiFunction):
                 stdin=farcompile_proc.stdout,
                 env=os.environ,
             )
-            for (normalized_text, text) in utterance_query:
+            for normalized_text, text in utterance_query:
                 if not normalized_text:
                     normalized_text = text
                 text = " ".join(
@@ -192,7 +195,7 @@ class TrainPhoneLmFunction(KaldiFunction):
         self.symbols_path = args.symbols_path
         self.order = args.order
 
-    def _run(self) -> typing.Generator[bool]:
+    def _run(self) -> None:
         """Run the function"""
         with self.session() as session, mfa_open(self.log_path, "w") as log_file:
             if config.USE_POSTGRES:
@@ -210,6 +213,7 @@ class TrainPhoneLmFunction(KaldiFunction):
             farcompile_proc = subprocess.Popen(
                 [
                     thirdparty_binary("farcompilestrings"),
+                    "--fst_type=compact",
                     "--token_type=symbol",
                     "--generate_keys=16",
                     f"--symbols={self.symbols_path}",
@@ -271,10 +275,9 @@ class TrainSpeakerLmFunction(KaldiFunction):
         self.target_num_ngrams = args.target_num_ngrams
         self.hclg_options = args.hclg_options
 
-    def _run(self) -> typing.Generator[bool]:
+    def _run(self) -> None:
         """Run the function"""
         with self.session() as session, mfa_open(self.log_path, "w") as log_file:
-
             job: Job = (
                 session.query(Job)
                 .options(joinedload(Job.corpus, innerjoin=True), subqueryload(Job.dictionaries))
@@ -293,7 +296,6 @@ class TrainSpeakerLmFunction(KaldiFunction):
                     .distinct()
                 )
                 for (speaker_id,) in speakers:
-                    print(speaker_id)
                     hclg_path = d.temp_directory.joinpath(f"{speaker_id}.fst")
                     if os.path.exists(hclg_path):
                         continue

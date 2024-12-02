@@ -21,7 +21,6 @@ from montreal_forced_aligner.exceptions import (
     FileArgumentNotFoundError,
     ModelExtensionError,
     ModelTypeNotSupportedError,
-    NoDefaultSpeakerDictionaryError,
     PretrainedModelNotFoundError,
 )
 from montreal_forced_aligner.helper import mfa_open
@@ -74,6 +73,12 @@ def common_options(f: typing.Callable) -> typing.Callable:
             default=None,
         ),
         click.option(
+            "--final_clean/--no_final_clean",
+            "final_clean",
+            help=f"Remove temporary files at the end of run, default is {config.FINAL_CLEAN}",
+            default=None,
+        ),
+        click.option(
             "--verbose/--no_verbose",
             "-v/-nv",
             "verbose",
@@ -95,9 +100,14 @@ def common_options(f: typing.Callable) -> typing.Callable:
         ),
         click.option(
             "--use_mp/--no_use_mp",
-            "--use_threading/--no_use_threading",
             "use_mp",
-            help="Turn on/off multithreading. Multithreading is recommended will allow for faster executions.",
+            help="Turn on/off multiprocessing. Multiprocessing is recommended will allow for faster executions.",
+            default=None,
+        ),
+        click.option(
+            "--use_threading/--no_use_threading",
+            "use_threading",
+            help="Use threading library rather than multiprocessing library. Multiprocessing is recommended will allow for faster executions.",
             default=None,
         ),
         click.option(
@@ -123,6 +133,7 @@ def common_options(f: typing.Callable) -> typing.Callable:
         ),
         click.option(
             "--textgrid_cleanup/--no_textgrid_cleanup",
+            "--cleanup_textgrids/--no_cleanup_textgrids",
             "cleanup_textgrids",
             help="Turn on/off post-processing of TextGrids that cleans up "
             "silences and recombines compound words and clitics.",
@@ -133,7 +144,7 @@ def common_options(f: typing.Callable) -> typing.Callable:
     return functools.reduce(lambda x, opt: opt(x), options, f)
 
 
-def validate_model_arg(name: str, model_type: str) -> Path:
+def validate_model_arg(name: str, model_type: str) -> typing.Union[Path, str]:
     """
     Validate pretrained model name argument
 
@@ -169,6 +180,8 @@ def validate_model_arg(name: str, model_type: str) -> Path:
     model_class = MODEL_TYPES[model_type]
     if name in available_models:
         name = model_class.get_pretrained_path(name)
+    elif model_type == "dictionary" and str(name).lower() in {"default", "nonnative"}:
+        return name
     else:
         if isinstance(name, str):
             name = Path(name)
@@ -181,8 +194,6 @@ def validate_model_arg(name: str, model_type: str) -> Path:
                 paths = sorted(set(data.values()))
                 for path in paths:
                     validate_model_arg(path, "dictionary")
-                if "default" not in data:
-                    raise click.BadParameter(str(NoDefaultSpeakerDictionaryError()))
     else:
         if name.exists():
             if name.suffix:
@@ -214,9 +225,16 @@ def validate_language_model(ctx, param, value):
         return validate_model_arg(value, "language_model")
 
 
-def validate_g2p_model(ctx, param, value):
+def validate_g2p_model(ctx, param, value: Path):
     """Validation callback for G2P model paths"""
-    return validate_model_arg(value, "g2p")
+    if Path(value).suffix == ".yaml":
+        with open(value, encoding="utf8") as f:
+            data = yaml.safe_load(f)
+            for k, v in data.items():
+                data[k] = validate_model_arg(v, "g2p")
+        return data
+    else:
+        return validate_model_arg(value, "g2p")
 
 
 def validate_tokenizer_model(ctx, param, value):
@@ -391,7 +409,7 @@ def check_server() -> None:
         logger.debug(f"pg_ctl stdout: {stdout}")
         logger.debug(f"pg_ctl stderr: {stderr}")
         if "no server running" in stdout:
-            raise DatabaseError()
+            raise DatabaseError(f"stdout: {stdout}\nstderr: {stderr}")
 
 
 def start_server() -> None:
@@ -454,7 +472,6 @@ def stop_server(mode: str = "smart") -> None:
         f"pg_mfa_{config.CURRENT_PROFILE_NAME}"
     )
     if not db_directory.exists():
-
         logger.error(f"There was no database found at {db_directory}.")
         sys.exit(1)
     logger.info(f"Stopping the {config.CURRENT_PROFILE_NAME} MFA database server...")

@@ -26,7 +26,7 @@ Text normalization and dictionary lookup
 
 If a word is not found in the dictionary, and has no orthographic
 markers for morpheme boundaries (apostrophes or hyphens), then it will
-be replaced in the output with '<unk>' for unknown word.
+be replaced in the output with :code:`<unk>` for unknown word.
 
 .. note::
 
@@ -44,11 +44,9 @@ from the ends and beginnings of words, except for the :code:`brackets` specified
 
    The definition of punctuation, clitic markers, and compound markers can be set in a config file, see :ref:`configuration_dictionary` for more details.
 
-Dictionary lookup will attempt to generate the most maximal coverage of
-novel forms if they use some overt morpheme boundary in the orthography.
+Dictionary lookup will attempt to generate the most maximal coverage of novel forms if they use some overt morpheme boundary in the orthography.
 
-For instance, in French, clitics are marked using apostrophes between the
-bound clitic and the stem.  Thus given a dictionary like:
+For instance, in French, clitics are marked using apostrophes between the bound clitic and the stem.  Thus given a dictionary like:
 
 .. highlight:: none
 
@@ -193,10 +191,31 @@ Modeling cutoffs and hesitations
 
 Often in spontaneous speech, speakers will produce truncated or cut-off words of the following word/words. To help model this specific case, using the flag :code:`--use_cutoff_model` will enable a mode where pronunciations are generated for cutoff words matching one of the following criteria:
 
-1. The cutoff word matches the pattern of :code:`{start_bracket}(cutoff|hes)`, where :code:`{start_bracket}` is the set of all left side brackets defined in :code:`brackets` (:ref:`configuration_dictionary`). The following word must not be an OOV or non-speech word (silence, laughter, another cutoff, etc).
+1. The cutoff word matches the pattern of :code:`{start_bracket}(cutoff|hes)`, where :code:`{start_bracket}` is the set of all left side brackets defined in :code:`brackets` (:ref:`configuration_dictionary`). Optionally, you can specify the intended word via a hyphen within the brackets (i.e., :code:`<cutoff-cut>`).  If a target word isn't specified, then the immediately following word will be used if it's not an OOV or non-speech word (silence, laughter, another cutoff, etc).
 2. The cutoff word matches the pattern of :code:`{start_bracket}(cutoff|hes)[-_](word){end_bracket}`, where start and end brackets are defined in :code:`brackets` (:ref:`configuration_dictionary`).  The :code:`word` will be used in place of the following word above, but needs to be present in the dictionary, otherwise the target word for the cutoff will default back to the following word.
 
-The generated pronunciations
+The generated pronunciations will be subsequences of the following word, along with an :code:`spn` pronunciation.  For example, consider an utterance transcript like
+
+::
+
+   <cutoff-off> with the <cutoff> <cutoff> cut off
+
+
+The following pronunciations will be generated for  the `English (US) MFA dictionary <https://mfa-models.readthedocs.io/en/latest/dictionary/English/English%20%28US%29%20MFA%20dictionary%20v3_0_0.html>`_:
+
+::
+
+  <cutoff>   spn
+  <cutoff-cut>   spn
+  <cutoff-cut>   kʰ ɐ t
+  <cutoff-cut>   kʰ ɐ
+  <cutoff-cut>   kʰ
+  <cutoff-off>   spn
+  <cutoff-off>   ɒ f
+  <cutoff-off>   ɒ
+  <cutoff-off>   ɑ f
+  <cutoff-off>   ɑ
+
 
 .. _speaker_dictionaries:
 

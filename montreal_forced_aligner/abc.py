@@ -6,8 +6,10 @@ Abstract Base Classes
 from __future__ import annotations
 
 import abc
+import contextlib
 import logging
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -27,6 +29,7 @@ from typing import (
     get_type_hints,
 )
 
+import requests
 import sqlalchemy
 import yaml
 from sqlalchemy.orm import scoped_session, sessionmaker
@@ -71,14 +74,33 @@ class KaldiFunction(metaclass=abc.ABCMeta):
 
     def __init__(self, args: MfaArguments):
         self.args = args
-        self.session = self.args.session
+        self.db_string = None
+        self._session = None
+        if isinstance(self.args.session, str):
+            self.db_string = self.args.session
+        else:
+            self._session = self.args.session
         self.job_name = self.args.job_name
         self.log_path = self.args.log_path
         self.callback = None
 
+    @contextlib.contextmanager
+    def session(self):
+        if self._session is not None:
+            with self._session() as session:
+                yield session
+        else:
+            db_engine = sqlalchemy.create_engine(self.db_string)
+            with sqlalchemy.orm.Session(db_engine) as session:
+                yield session
+
     def run(self):
         """Run the function, calls subclassed object's ``_run`` with error handling"""
         try:
+            if self._session is not None:
+                config.USE_THREADING = True
+            else:
+                config.USE_THREADING = False
             self._run()
         except Exception:
             exc_type, exc_value, exc_traceback = sys.exc_info()
@@ -261,7 +283,8 @@ class DatabaseMixin(TemporaryDirectoryMixin, metaclass=abc.ABCMeta):
                     )
                 except Exception:
                     raise DatabaseError(
-                        f"There was an error connecting to the {config.CURRENT_PROFILE_NAME} MFA database server. "
+                        f"There was an error connecting to the {config.CURRENT_PROFILE_NAME} MFA database server "
+                        f"at {config.database_socket()}. "
                         "Please ensure the server is initialized (mfa server init) or running (mfa server start)"
                     )
                 exist_check = False
@@ -282,7 +305,7 @@ class DatabaseMixin(TemporaryDirectoryMixin, metaclass=abc.ABCMeta):
                 conn.execute(sqlalchemy.text("CREATE EXTENSION IF NOT EXISTS vector"))
                 conn.execute(sqlalchemy.text("CREATE EXTENSION IF NOT EXISTS pg_trgm"))
                 conn.execute(sqlalchemy.text("CREATE EXTENSION IF NOT EXISTS pg_stat_statements"))
-                conn.execute(sqlalchemy.text(f"select setseed({config.SEED/32768})"))
+                conn.execute(sqlalchemy.text(f"select setseed({config.SEED / 32768})"))
                 conn.commit()
 
         MfaSqlBase.metadata.create_all(self.db_engine)
@@ -294,7 +317,7 @@ class DatabaseMixin(TemporaryDirectoryMixin, metaclass=abc.ABCMeta):
             self._db_engine = self.construct_engine()
         return self._db_engine
 
-    def get_next_primary_key(self, database_table: MfaSqlBase):
+    def get_next_primary_key(self, database_table):
         with self.session() as session:
             pk = session.query(sqlalchemy.func.max(database_table.id)).scalar()
             if not pk:
@@ -382,8 +405,8 @@ class DatabaseMixin(TemporaryDirectoryMixin, metaclass=abc.ABCMeta):
         if not config.USE_POSTGRES:
             if kwargs.pop("read_only", False):
                 db_string += "?mode=ro&nolock=1&uri=true"
-        kwargs["pool_size"] = 10
-        kwargs["max_overflow"] = 10
+        kwargs["pool_size"] = config.NUM_JOBS + 10
+        kwargs["max_overflow"] = config.NUM_JOBS + 10
         e = sqlalchemy.create_engine(
             db_string,
             **kwargs,
@@ -568,6 +591,8 @@ class TopLevelMfaWorker(MfaWorker, TemporaryDirectoryMixin, metaclass=abc.ABCMet
         self.check_previous_run()
         if hasattr(self, "initialize_database"):
             self.initialize_database()
+        if hasattr(self, "inspect_database"):
+            self.inspect_database()
 
     @property
     def working_directory(self) -> Path:
@@ -593,6 +618,8 @@ class TopLevelMfaWorker(MfaWorker, TemporaryDirectoryMixin, metaclass=abc.ABCMet
         dict[str, Any]
             Dictionary of specified configuration parameters
         """
+        from montreal_forced_aligner.data import Language
+
         param_types = cls.get_configuration_parameters()
         params = {}
         unknown_dict = {}
@@ -610,11 +637,15 @@ class TopLevelMfaWorker(MfaWorker, TemporaryDirectoryMixin, metaclass=abc.ABCMet
                 unknown_dict[name] = val
         for name, param_type in param_types.items():
             if (name.endswith("_directory") and name != "audio_directory") or (
-                name.endswith("_path") and name not in {"rules_path", "groups_path"}
+                name.endswith("_path")
+                and name not in {"rules_path", "phone_groups_path", "topology_path"}
             ):
                 continue
             if args is not None and name in args and args[name] is not None:
-                params[name] = param_type(args[name])
+                if param_type == Language:
+                    params[name] = param_type[args[name]]
+                else:
+                    params[name] = param_type(args[name])
             elif name in unknown_dict:
                 params[name] = param_type(unknown_dict[name])
                 if param_type == bool and not isinstance(unknown_dict[name], bool):
@@ -672,6 +703,30 @@ class TopLevelMfaWorker(MfaWorker, TemporaryDirectoryMixin, metaclass=abc.ABCMet
                 logger.error("There was an error in the run, please see the log.")
             else:
                 logger.info(f"Done! Everything took {time.time() - self.start_time:.3f} seconds")
+                if config.FINAL_CLEAN:
+                    logger.debug(
+                        "Cleaning up temporary files, use the --no_final_clean flag to keep temporary files."
+                    )
+                    if hasattr(self, "delete_database"):
+                        if config.USE_POSTGRES:
+                            proc = subprocess.run(
+                                [
+                                    "dropdb",
+                                    f"--host={config.database_socket()}",
+                                    "--if-exists",
+                                    "--force",
+                                    self.identifier,
+                                ],
+                                stderr=subprocess.PIPE,
+                                stdout=subprocess.PIPE,
+                                check=True,
+                                encoding="utf-8",
+                            )
+                            logger.debug(f"Stdout: {proc.stdout}")
+                            logger.debug(f"Stderr: {proc.stderr}")
+                        else:
+                            self.delete_database()
+                    self.clean_working_directory()
             self.save_worker_config()
             self.cleanup_logger()
         except (NameError, ValueError):  # already cleaned up
@@ -714,13 +769,17 @@ class TopLevelMfaWorker(MfaWorker, TemporaryDirectoryMixin, metaclass=abc.ABCMet
         """
         if not os.path.exists(self.worker_config_path):
             return True
-        conf = load_configuration(self.worker_config_path)
-        self._validate_previous_configuration(conf)
-        if not config.CLEAN and self.dirty:
-            logger.warning(
-                "The previous run had a different configuration than the current, which may cause issues."
-                " Please see the log for details or use --clean flag if issues are encountered."
-            )
+        try:
+            conf = load_configuration(self.worker_config_path)
+            self._validate_previous_configuration(conf)
+            if not config.CLEAN and self.dirty:
+                logger.warning(
+                    "The previous run had a different configuration than the current, which may cause issues."
+                    " Please see the log for details or use --clean flag if issues are encountered."
+                )
+        except yaml.error.YAMLError:
+            logger.warning("The previous run's configuration could not be loaded.")
+            return False
 
     @property
     def identifier(self) -> str:
@@ -754,6 +813,24 @@ class TopLevelMfaWorker(MfaWorker, TemporaryDirectoryMixin, metaclass=abc.ABCMet
         os.makedirs(self.output_directory, exist_ok=True)
         configure_logger("mfa", log_file=self.log_file)
         logger = logging.getLogger("mfa")
+        if config.VERBOSE:
+            try:
+                response = requests.get(
+                    "https://api.github.com/repos/MontrealCorpusTools/Montreal-Forced-Aligner/releases/latest"
+                )
+                latest_version = response.json()["tag_name"].replace("v", "")
+                if current_version < latest_version:
+                    logger.debug(
+                        f"You are currently running an older version of MFA ({current_version}) than the latest available ({latest_version}). "
+                        f"To update, please run mfa_update."
+                    )
+            except Exception:
+                pass
+        if re.search(r"\d+\.\d+\.\d+a", current_version) is not None:
+            logger.debug(
+                "Please be aware that you are running an alpha version of MFA. If you would like to install a more "
+                "stable version, please visit https://montreal-forced-aligner.readthedocs.io/en/latest/installation.html#installing-older-versions-of-mfa",
+            )
         logger.debug(f"Beginning run for {self.data_source_identifier}")
         logger.debug(f'Using "{config.CURRENT_PROFILE_NAME}" profile')
         if config.USE_MP:
@@ -835,6 +912,8 @@ class TrainerMixin(ModelExporterMixin):
     ----------
     num_iterations: int
         Number of training iterations
+    model_version: str
+        Override for model version
 
     Attributes
     ----------
@@ -842,10 +921,11 @@ class TrainerMixin(ModelExporterMixin):
         Current iteration
     """
 
-    def __init__(self, num_iterations: int = 40, **kwargs):
+    def __init__(self, num_iterations: int = 40, model_version: str = None, **kwargs):
         super().__init__(**kwargs)
         self.iteration: int = 0
         self.num_iterations = num_iterations
+        self.model_version = model_version
 
     @abc.abstractmethod
     def initialize_training(self) -> None:

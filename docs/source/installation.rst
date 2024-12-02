@@ -7,7 +7,7 @@ Installation
 
 .. important::
 
-   Kaldi and MFA are now built on :xref:`conda_forge` :fas:`party-horn`, so installation of third party binaries is wholly through conda from 2.0.0b4 onwards. Installing MFA via conda will pick up Kaldi as well.
+   Kaldi and MFA are now built on :xref:`conda_forge` :fas:`party-horn`, so installation of third party binaries is wholly through conda. Installing MFA via conda will pick up Kaldi as well.
 
 
 General installation
@@ -19,6 +19,23 @@ General installation
    a.  You can enable the :code:`conda-forge` channel by default by running :code:`conda config --add channels conda-forge` in order to omit the :code:`-c conda-forge` from these commands
 
 3. Ensure you're in the new environment created (:code:`conda activate aligner`)
+
+.. note::
+
+   I recommend using :code:`mamba` as the primary installer.  Mamba is a drop-in replacement for the conda command that needs to be installed in the conda base environment.  You can install and use :code:`mamba` via:
+
+   1. :code:`conda activate base`
+   2. :code:`conda install -c conda-forge mamba`
+   3. :code:`mamba create -n aligner -c conda-forge montreal-forced-aligner`
+
+Updating Montreal Forced Aligner
+--------------------------------
+
+To install the latest version, please run either :code:`conda update -c conda-forge montreal-forced-aligner kalpy kaldi=*=cpu* --update-deps` or  :code:`mamba update -c conda-forge montreal-forced-aligner kalpy kaldi=*=cpu* --update-deps` if you have mamba installed.
+
+.. versionadded:: 3.0.5
+
+   MFA version 3.0.5 onward has a helper utility for updating to new versions.  Run :code:`mfa_update` to fetch the latest versions of MFA, Kalpy, and Kaldi.
 
 Installing SpeechBrain
 ----------------------
@@ -38,15 +55,16 @@ Installing older versions of MFA
 
 If you need to use an older version of MFA, you can install it via:
 
-```
-conda install montreal-forced-aligner=X.X.X
-```
+.. code-block:: bash
+
+   conda install montreal-forced-aligner=X.X.X
 
 More stable key versions:
 
-* Stable 2.2 release: :code:`conda install montreal-forced-aligner=2.2.17`
-* Stable 2.1 release: :code:`conda install montreal-forced-aligner=2.1.7`
-* Stable 2.0 release: :code:`conda install montreal-forced-aligner=2.0.6`
+* Stable 3.0 release: :code:`conda update -c conda-forge montreal-forced-aligner`
+* Stable 2.2 release: :code:`conda install -c conda-forge montreal-forced-aligner=2.2.17 openfst=1.8.2 kaldi=5.5.1068`
+* Stable 2.1 release: :code:`conda install -c conda-forge montreal-forced-aligner=2.1.7 openfst=1.8.2 kaldi=5.5.1068`
+* Stable 2.0 release: :code:`conda install -c conda-forge montreal-forced-aligner=2.0.6 openfst=1.8.2 kaldi=5.5.1068`
 * Stable 1.0 release: https://github.com/MontrealCorpusTools/Montreal-Forced-Aligner/releases/tag/v1.0.1
 
 .. _docker_installation:
@@ -161,8 +179,3 @@ MFA temporary files
 ===================
 
 MFA uses a temporary directory for commands that can be specified in running commands with ``--temp_directory`` (or see :ref:`configuration`), and it also uses a directory to store global configuration settings and saved models.  By default this root directory is ``~/Documents/MFA``, but if you would like to put this somewhere else, you can set the environment variable ``MFA_ROOT_DIR`` to use that.  MFA will raise an error on load if it's unable to write the specified root directory.
-
-Supported functionality
-=======================
-
-As of version 2.0.6, all features are available on all platforms.  Prior to this version, G2P and language model training was unavailable on native Windows, but could be used with Windows Subsystem for Linux (WSL).

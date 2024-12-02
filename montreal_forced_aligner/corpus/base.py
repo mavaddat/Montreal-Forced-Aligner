@@ -4,6 +4,7 @@ from __future__ import annotations
 import collections
 import logging
 import os
+import re
 import threading
 import time
 import typing
@@ -12,7 +13,6 @@ from pathlib import Path
 
 import sqlalchemy.engine
 from sqlalchemy.orm import Session, joinedload, selectinload, subqueryload
-from tqdm.rich import tqdm
 
 from montreal_forced_aligner import config
 from montreal_forced_aligner.abc import DatabaseMixin, MfaWorker
@@ -312,17 +312,22 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
     def create_corpus_split(self) -> None:
         """Create split directory and output information from Jobs"""
         os.makedirs(self.split_directory.joinpath("log"), exist_ok=True)
-        with self.session() as session, tqdm(
-            total=self.num_utterances, disable=config.QUIET
-        ) as pbar:
+        with self.session() as session:
             jobs = session.query(Job)
             arguments = [
-                ExportKaldiFilesArguments(j.id, self.session, None, self.split_directory)
+                ExportKaldiFilesArguments(
+                    j.id,
+                    getattr(self, "session" if config.USE_THREADING else "db_string", ""),
+                    None,
+                    self.split_directory,
+                )
                 for j in jobs
             ]
 
-            for _ in run_kaldi_function(ExportKaldiFilesFunction, arguments, pbar.update):
-                pass
+        for _ in run_kaldi_function(
+            ExportKaldiFilesFunction, arguments, total_count=self.num_utterances
+        ):
+            pass
 
     @property
     def corpus_word_set(self) -> typing.List[str]:
@@ -610,18 +615,33 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
         self._num_files = None
         session.commit()
 
-    def normalize_text_arguments(self):
+    def get_tokenizers(self):
         from montreal_forced_aligner.dictionary.mixins import DictionaryMixin
 
         if self.language is Language.unknown:
             tokenizers = getattr(self, "tokenizers", None)
         else:
+            from montreal_forced_aligner.tokenization.spacy import (
+                check_language_tokenizer_availability,
+            )
+
+            check_language_tokenizer_availability(self.language)
             tokenizers = self.language
         if tokenizers is None:
             if isinstance(self, DictionaryMixin):
                 tokenizers = self.tokenizer
             else:
                 return None
+        return tokenizers
+
+    def get_tokenizer(self, dictionary_id: int):
+        tokenizers = self.get_tokenizers()
+        if not isinstance(tokenizers, dict):
+            return tokenizers
+        return tokenizers[dictionary_id]
+
+    def normalize_text_arguments(self):
+        tokenizers = self.get_tokenizers()
         from montreal_forced_aligner.corpus.multiprocessing import NormalizeTextArguments
 
         with self.session() as session:
@@ -629,10 +649,12 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
             return [
                 NormalizeTextArguments(
                     j.id,
-                    self.session,
+                    getattr(self, "session" if config.USE_THREADING else "db_string", ""),
                     self.split_directory.joinpath("log", f"normalize.{j.id}.log"),
                     tokenizers,
                     getattr(self, "g2p_model", None),
+                    getattr(self, "ignore_case", True),
+                    getattr(self, "use_cutoff_model", False),
                 )
                 for j in jobs
             ]
@@ -654,7 +676,7 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
         pronunciation_insert_mappings = []
         word_indexes = {}
         word_mapping_ids = {}
-        max_mapping_ids = {}
+        max_mapping_id = 0
         log_directory.mkdir(parents=True, exist_ok=True)
         update_mapping = []
         word_key = self.get_next_primary_key(Word)
@@ -664,46 +686,50 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
         if isinstance(self, G2PTopLevelMixin):  # G2P happens later
             g2p_model = None
         pronunciation_key = self.get_next_primary_key(Pronunciation)
-        with mfa_open(log_directory.joinpath("normalize_oov.log"), "w") as log_file:
-            with tqdm(
-                total=self.num_utterances, disable=config.QUIET
-            ) as pbar, self.session() as session:
-                dictionaries: typing.Dict[int, Dictionary] = {
-                    d.id: d for d in session.query(Dictionary)
+        with mfa_open(
+            log_directory.joinpath("normalize_oov.log"), "w"
+        ) as log_file, self.session() as session:
+            dictionaries: typing.Dict[int, Dictionary] = {
+                d.id: d for d in session.query(Dictionary)
+            }
+            dict_name_to_id = {v.name: k for k, v in dictionaries.items()}
+            has_words = (
+                session.query(Dictionary).filter(Dictionary.name == "unknown").first() is None
+            )
+            existing_oovs = {}
+            words = session.query(
+                Word.id, Word.mapping_id, Word.dictionary_id, Word.word, Word.word_type
+            ).order_by(Word.mapping_id)
+            if not has_words or getattr(self, "use_g2p", False):
+                word_insert_mappings[(1, "<eps>")] = {
+                    "id": word_key,
+                    "word": "<eps>",
+                    "word_type": WordType.silence,
+                    "mapping_id": word_key - 1,
+                    "count": 0,
+                    "dictionary_id": 1,
                 }
-                has_words = (
-                    session.query(Dictionary).filter(Dictionary.name == "unknown").first() is None
-                )
-                existing_oovs = set()
-                words = session.query(
-                    Word.id, Word.mapping_id, Word.dictionary_id, Word.word, Word.word_type
-                ).order_by(Word.mapping_id)
-                if not has_words or getattr(self, "use_g2p", False):
-                    word_insert_mappings["<eps>"] = {
-                        "id": word_key,
-                        "word": "<eps>",
-                        "word_type": WordType.silence,
-                        "mapping_id": word_key - 1,
-                        "count": 0,
-                        "dictionary_id": 1,
-                    }
-                    word_key += 1
-                    max_mapping_ids[1] = word_key - 1
-                for w_id, m_id, d_id, w, wt in words:
-                    if wt is WordType.oov:
-                        existing_oovs.add(w)
-                        continue
-                    word_indexes[(d_id, w)] = w_id
-                    word_mapping_ids[(d_id, w)] = m_id
-                    max_mapping_ids[d_id] = m_id
-                to_g2p = set()
-                word_to_g2p_mapping = {
-                    x: collections.defaultdict(set) for x in dictionaries.keys()
-                }
-                word_counts = collections.defaultdict(int)
-                for result in run_kaldi_function(NormalizeTextFunction, args, pbar.update):
+                word_key += 1
+                max_mapping_id = word_key - 1
+            for w_id, m_id, d_id, w, wt in words:
+                if wt is WordType.oov and w not in self.specials_set:
+                    existing_oovs[(d_id, w)] = {"id": w_id, "count": 0, "included": False}
+                    continue
+                word_indexes[(d_id, w)] = w_id
+                word_mapping_ids[w] = m_id
+                if m_id > max_mapping_id:
+                    max_mapping_id = m_id
+            to_g2p = set()
+            word_to_g2p_mapping = {x: collections.defaultdict(set) for x in dictionaries.keys()}
+            word_counts = collections.defaultdict(int)
+            for result in run_kaldi_function(
+                NormalizeTextFunction, args, total_count=self.num_utterances
+            ):
+                try:
                     result, dict_id = result
-                    if has_words and not getattr(self, "use_g2p", False):
+                    if dict_id is None:
+                        dict_id = list(dictionaries.keys())[0]
+                    if has_words and not getattr(self, "use_g2p", False) and g2p_model is not None:
                         oovs = set(result["oovs"].split())
                         pronunciation_text = result["normalized_character_text"].split()
                         for i, w in enumerate(result["normalized_text"].split()):
@@ -713,74 +739,102 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
                                 word_counts[(dict_id, w)] += 1
                                 oovs.add(w)
                                 if self.language is Language.unknown:
-                                    to_g2p.add(w)
+                                    to_g2p.add((w, dict_id))
+                                    word_to_g2p_mapping[dict_id][w].add(w)
                                 else:
-                                    if g2p_model is not None:
-                                        if any(
-                                            not g2p_model.grapheme_table.member(x)
-                                            for x in pronunciation_text[i]
-                                        ):
-                                            log_file.write(
-                                                f"{result['id']}: {result['normalized_text']} ({result['normalized_character_text']})\n"
-                                            )
-                                    to_g2p.add(pronunciation_text[i])
+                                    to_g2p.add((pronunciation_text[i], dict_id))
                                     word_to_g2p_mapping[dict_id][w].add(pronunciation_text[i])
                             elif (dict_id, w) not in word_update_mappings:
                                 word_update_mappings[(dict_id, w)] = {
                                     "id": word_indexes[(dict_id, w)],
-                                    "count": 0,
+                                    "count": 1,
                                 }
+                            else:
                                 word_update_mappings[(dict_id, w)]["count"] += 1
                         result["oovs"] = " ".join(sorted(oovs))
                     else:
-                        for word in result["normalized_text"].split():
-                            if word not in word_insert_mappings:
-                                word_insert_mappings[word] = {
-                                    "id": word_key,
-                                    "word": word,
-                                    "word_type": WordType.oov,
-                                    "mapping_id": word_key - 1,
-                                    "count": 0,
-                                    "dictionary_id": 1,
-                                }
-                                pronunciation_insert_mappings.append(
-                                    {
-                                        "id": pronunciation_key,
-                                        "word_id": word_key,
-                                        "pronunciation": getattr(self, "oov_phone", "spn"),
+                        for w in result["normalized_text"].split():
+                            if (dict_id, w) in existing_oovs:
+                                existing_oovs[(dict_id, w)]["count"] += 1
+                            elif (dict_id, w) not in word_indexes:
+                                if (dict_id, w) not in word_insert_mappings:
+                                    word_insert_mappings[(dict_id, w)] = {
+                                        "id": word_key,
+                                        "word": w,
+                                        "word_type": WordType.oov,
+                                        "mapping_id": word_key - 1,
+                                        "count": 0,
+                                        "dictionary_id": dict_id,
+                                        "included": False,
                                     }
-                                )
-                                word_key += 1
-                                pronunciation_key += 1
-                            word_insert_mappings[word]["count"] += 1
+                                    pronunciation_insert_mappings.append(
+                                        {
+                                            "id": pronunciation_key,
+                                            "word_id": word_key,
+                                            "pronunciation": getattr(self, "oov_phone", "spn"),
+                                        }
+                                    )
+                                    word_key += 1
+                                    pronunciation_key += 1
+                                word_insert_mappings[(dict_id, w)]["count"] += 1
+                            elif (dict_id, w) not in word_update_mappings:
+                                word_update_mappings[(dict_id, w)] = {
+                                    "id": word_indexes[(dict_id, w)],
+                                    "count": 1,
+                                }
+                            else:
+                                word_update_mappings[(dict_id, w)]["count"] += 1
 
                     update_mapping.append(result)
-                bulk_update(session, Utterance, update_mapping)
-                session.commit()
-                if word_update_mappings:
-                    if has_words:
-                        session.query(Word).update({"count": 0})
-                        session.commit()
-                        bulk_update(session, Word, list(word_update_mappings.values()))
-                        session.commit()
+                except Exception:
+                    import sys
+                    import traceback
+
+                    exc_type, exc_value, exc_traceback = sys.exc_info()
+                    logger.debug(
+                        "\n".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+                    )
+                    raise
+
+            bulk_update(session, Utterance, update_mapping)
+            session.commit()
+            if word_update_mappings:
+                if has_words:
+                    session.query(Word).update({"count": 0})
+                    session.commit()
+                    bulk_update(session, Word, list(word_update_mappings.values()))
+                    session.commit()
             with self.session() as session:
                 if to_g2p:
                     log_file.write(f"Found {len(to_g2p)} OOVs\n")
                     if g2p_model is not None:
                         from montreal_forced_aligner.g2p.generator import PyniniGenerator
 
-                        gen = PyniniGenerator(
-                            g2p_model_path=g2p_model.source,
-                            word_list=to_g2p,
-                            num_pronunciations=1,
-                            strict_graphemes=True,
-                        )
-                        g2pped = gen.generate_pronunciations()
+                        g2pped = {}
+                        if isinstance(g2p_model, dict):
+                            for dict_name, g2p_model in g2p_model.items():
+                                dict_id = dict_name_to_id[dict_name]
+                                gen = PyniniGenerator(
+                                    g2p_model_path=g2p_model.source,
+                                    word_list=[x[0] for x in to_g2p if x[1] == dict_id],
+                                    num_pronunciations=1,
+                                    strict_graphemes=True,
+                                )
+                                g2pped[dict_id] = gen.generate_pronunciations()
+                        else:
+                            gen = PyniniGenerator(
+                                g2p_model_path=g2p_model.source,
+                                word_list=[x[0] for x in to_g2p],
+                                num_pronunciations=1,
+                                strict_graphemes=True,
+                            )
+                            dict_id = list(dictionaries.keys())[0]
+                            g2pped[dict_id] = gen.generate_pronunciations()
                         for dict_id, mapping in word_to_g2p_mapping.items():
                             log_file.write(f"For dictionary {dict_id}:\n")
                             for w, ps in mapping.items():
                                 log_file.write(f"  - {w} ({', '.join(sorted(ps))})\n")
-                                max_mapping_ids[dict_id] += 1
+                                max_mapping_id += 1
                                 included = False
                                 if hasattr(self, "brackets") and any(
                                     w.startswith(b) for b, _ in self.brackets
@@ -789,18 +843,25 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
                                     pronunciations = [getattr(self, "oov_phone", "spn")]
                                 else:
                                     word_type = WordType.speech
-                                    pronunciations = [
-                                        g2pped[x][0] for x in ps if x in g2pped and g2pped[x]
-                                    ]
+                                    if isinstance(g2pped, dict):
+                                        pronunciations = [
+                                            g2pped[dict_id][x][0]
+                                            for x in ps
+                                            if x in g2pped[dict_id] and g2pped[dict_id][x]
+                                        ]
+                                    else:
+                                        pronunciations = [
+                                            g2pped[x][0] for x in ps if x in g2pped and g2pped[x]
+                                        ]
                                     if not pronunciations:
                                         word_type = WordType.oov
                                         pronunciations = [getattr(self, "oov_phone", "spn")]
                                     else:
                                         included = True
 
-                                word_insert_mappings[(w, dict_id)] = {
+                                word_insert_mappings[(dict_id, w)] = {
                                     "id": word_key,
-                                    "mapping_id": max_mapping_ids[d_id],
+                                    "mapping_id": max_mapping_id,
                                     "word": w,
                                     "count": word_counts[(dict_id, w)],
                                     "dictionary_id": dict_id,
@@ -819,17 +880,19 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
                                     pronunciation_key += 1
                                 word_key += 1
                     else:
-                        for word in to_g2p:
-                            if word in existing_oovs:
+                        for word, dict_id in to_g2p:
+                            if (dict_id, word) in existing_oovs:
+                                existing_oovs[(dict_id, word)]["count"] += 1
                                 continue
-                            if word not in word_insert_mappings:
-                                word_insert_mappings[word] = {
+                            if (dict_id, word) not in word_insert_mappings:
+                                word_insert_mappings[(dict_id, word)] = {
                                     "id": word_key,
                                     "word": word,
                                     "word_type": WordType.oov,
                                     "mapping_id": word_key - 1,
                                     "count": 0,
-                                    "dictionary_id": 1,
+                                    "included": False,
+                                    "dictionary_id": dict_id,
                                 }
                                 pronunciation_insert_mappings.append(
                                     {
@@ -840,9 +903,12 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
                                 )
                                 word_key += 1
                                 pronunciation_key += 1
-                            word_insert_mappings[word]["count"] += 1
+                            word_insert_mappings[(dict_id, word)]["count"] += 1
+                log_file.write("Found the following OOVs:\n")
+                log_file.write(f"{existing_oovs}\n")
+                log_file.write(f"{word_insert_mappings}\n")
                 if not has_words:
-                    word_insert_mappings["<unk>"] = {
+                    word_insert_mappings[(1, "<unk>")] = {
                         "id": word_key,
                         "word": "<unk>",
                         "word_type": WordType.oov,
@@ -850,6 +916,9 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
                         "count": 0,
                         "dictionary_id": 1,
                     }
+                if existing_oovs:
+                    bulk_update(session, Word, list(existing_oovs.values()))
+                    session.commit()
                 if word_insert_mappings:
                     session.bulk_insert_mappings(
                         Word,
@@ -867,10 +936,11 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
                 self.text_normalized = True
                 session.query(Corpus).update({"text_normalized": True})
                 session.commit()
-                session.query(Word).filter(Word.word_type == WordType.speech).filter(
-                    Word.count <= self.oov_count_threshold
-                ).update({Word.included: False})
-                session.commit()
+                if self.oov_count_threshold > 0:
+                    session.query(Word).filter(Word.word_type == WordType.speech).filter(
+                        Word.count <= self.oov_count_threshold
+                    ).update({Word.included: False, Word.word_type: WordType.oov})
+                    session.commit()
 
     def add_speaker(self, name: str, session: Session = None):
         """
@@ -966,7 +1036,6 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
                 sample_rate=file.wav_info.sample_rate,
                 duration=file.wav_info.duration,
                 num_channels=file.wav_info.num_channels,
-                sox_string=file.wav_info.sox_string,
             )
             session.add(sf)
         if file.text_path is not None:
@@ -1058,7 +1127,6 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
                     "sample_rate": file.wav_info.sample_rate,
                     "duration": file.wav_info.duration,
                     "num_channels": file.wav_info.num_channels,
-                    "sox_string": file.wav_info.sox_string,
                 }
             )
         if file.text_path is not None:
@@ -1121,54 +1189,142 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
             Number of utterances to include in subset
         """
         logger.info(f"Creating subset directory with {subset} utterances...")
-        subset_directory = self.corpus_output_directory.joinpath(f"subset_{subset}")
-        log_dir = subset_directory.joinpath("log")
-        os.makedirs(log_dir, exist_ok=True)
-        num_dictionaries = getattr(self, "num_dictionaries", 1)
+        if hasattr(self, "cutoff_word") and hasattr(self, "brackets"):
+            initial_brackets = re.escape("".join(x[0] for x in self.brackets))
+            final_brackets = re.escape("".join(x[1] for x in self.brackets))
+            cutoff_identifier = re.sub(
+                rf"[{initial_brackets}{final_brackets}]", "", self.cutoff_word
+            )
+            cutoff_pattern = f"[{initial_brackets}]({cutoff_identifier}|hes)"
+        else:
+            cutoff_pattern = "<(cutoff|hes)"
+
+        def add_filters(query):
+            subset_word_count = getattr(self, "subset_word_count", 3)
+            multiword_pattern = rf"(\s\S+){{{subset_word_count},}}"
+            filtered = (
+                query.filter(
+                    Utterance.normalized_text.op("~")(multiword_pattern)
+                    if config.USE_POSTGRES
+                    else Utterance.normalized_text.regexp_match(multiword_pattern)
+                )
+                .filter(Utterance.ignored == False)  # noqa
+                .filter(
+                    sqlalchemy.or_(
+                        Utterance.duration_deviation == None,  # noqa
+                        Utterance.duration_deviation < 10,
+                    )
+                )
+            )
+            if subset <= 25000:
+                filtered = filtered.filter(
+                    sqlalchemy.not_(
+                        Utterance.normalized_text.op("~")(cutoff_pattern)
+                        if config.USE_POSTGRES
+                        else Utterance.normalized_text.regexp_match(cutoff_pattern)
+                    )
+                )
+
+            return filtered
+
         with self.session() as session:
             begin = time.time()
-            session.query(Utterance).update({Utterance.in_subset: False})
+            session.query(Utterance).filter(Utterance.in_subset == True).update(  # noqa
+                {Utterance.in_subset: False}
+            )
+            session.commit()
+            dictionary_query = session.query(Dictionary.name, Dictionary.id).filter(
+                Dictionary.name != "default"
+            )
+            if subset <= 25000:
+                dictionary_query = dictionary_query.filter(Dictionary.name != "nonnative")
+            dictionary_lookup = {k: v for k, v in dictionary_query}
+            num_dictionaries = len(dictionary_lookup)
             if num_dictionaries > 1:
                 subsets_per_dictionary = {}
                 utts_per_dictionary = {}
                 subsetted = 0
-                for dict_id in getattr(self, "dictionary_lookup", {}).values():
-                    num_utts = (
+                for dict_name, dict_id in dictionary_lookup.items():
+                    base_query = (
                         session.query(Utterance)
                         .join(Utterance.speaker)
-                        .filter(Speaker.dictionary_id == dict_id)
-                        .count()
+                        .filter(Speaker.dictionary_id == dict_id)  # noqa
                     )
-                    utts_per_dictionary[dict_id] = num_utts
+                    base_query = add_filters(base_query)
+                    num_utts = base_query.count()
+                    utts_per_dictionary[dict_name] = num_utts
                     if num_utts < int(subset / num_dictionaries):
-                        subsets_per_dictionary[dict_id] = num_utts
+                        subsets_per_dictionary[dict_name] = num_utts
                         subsetted += 1
                 remaining_subset = subset - sum(subsets_per_dictionary.values())
                 remaining_dicts = num_dictionaries - subsetted
                 remaining_subset_per_dictionary = int(remaining_subset / remaining_dicts)
-                for dict_id in getattr(self, "dictionary_lookup", {}).values():
-                    num_utts = utts_per_dictionary[dict_id]
-                    if dict_id in subsets_per_dictionary:
-                        subset_per_dictionary = subsets_per_dictionary[dict_id]
+                for dict_name, num_utts in sorted(utts_per_dictionary.items(), key=lambda x: x[1]):
+                    dict_id = dictionary_lookup[dict_name]
+                    if dict_name in subsets_per_dictionary:
+                        subset_per_dictionary = subsets_per_dictionary[dict_name]
                     else:
                         subset_per_dictionary = remaining_subset_per_dictionary
-                    logger.debug(f"For {dict_id}, total number of utterances is {num_utts}")
+                        remaining_dicts -= 1
+                        if remaining_dicts > 0:
+                            if num_utts < subset_per_dictionary:
+                                remaining_subset -= num_utts
+                            else:
+                                remaining_subset -= subset_per_dictionary
+                            remaining_subset_per_dictionary = int(
+                                remaining_subset / remaining_dicts
+                            )
+                    logger.debug(f"For {dict_name}, total number of utterances is {num_utts}")
                     larger_subset_num = int(subset_per_dictionary * 10)
+                    speaker_ids = None
+                    average_duration = (
+                        add_filters(
+                            session.query(sqlalchemy.func.avg(Utterance.duration))
+                            .join(Utterance.speaker)
+                            .filter(Speaker.dictionary_id == dict_id)
+                        )
+                    ).first()[0]
+                    for utt_count_cutoff in [30, 15, 5]:
+                        sq = (
+                            add_filters(
+                                session.query(
+                                    Speaker.id.label("speaker_id"),
+                                    sqlalchemy.func.count(Utterance.id).label("utt_count"),
+                                )
+                                .join(Utterance.speaker)
+                                .filter(Speaker.dictionary_id == dict_id)
+                            )
+                            .filter(Utterance.duration <= average_duration)
+                            .group_by(Speaker.id.label("speaker_id"))
+                            .subquery()
+                        )
+                        total_speaker_utterances = (
+                            session.query(sqlalchemy.func.sum(sq.c.utt_count)).filter(
+                                sq.c.utt_count >= utt_count_cutoff
+                            )
+                        ).first()[0]
+                        if total_speaker_utterances >= subset_per_dictionary:
+                            speaker_ids = [
+                                x
+                                for x, in session.query(sq.c.speaker_id).filter(
+                                    sq.c.utt_count >= utt_count_cutoff
+                                )
+                            ]
+                            break
                     if num_utts > larger_subset_num:
                         larger_subset_query = (
                             session.query(Utterance.id)
                             .join(Utterance.speaker)
-                            .filter(Speaker.dictionary_id == dict_id)
-                            .filter(
-                                Utterance.normalized_text.op("~")(r" [^ ]+ ")
-                                if config.USE_POSTGRES
-                                else Utterance.normalized_text.regexp_match(r" [^ ]+ ")
-                            )
-                            .filter(Utterance.ignored == False)  # noqa
-                            .order_by(Utterance.duration)
-                            .limit(larger_subset_num)
+                            .filter(Speaker.dictionary_id == dict_id)  # noqa
                         )
-
+                        larger_subset_query = add_filters(larger_subset_query)
+                        if speaker_ids:
+                            larger_subset_query = larger_subset_query.filter(
+                                Speaker.id.in_(speaker_ids)
+                            )
+                        larger_subset_query = larger_subset_query.order_by(
+                            Utterance.duration
+                        ).limit(larger_subset_num)
                         sq = larger_subset_query.subquery()
                         subset_utts = (
                             sqlalchemy.select(sq.c.id)
@@ -1183,14 +1339,37 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
                             .where(Utterance.id.in_(subset_utts))
                         )
                         session.execute(query)
-                        logger.debug(f"For {dict_id}, subset is {subset_per_dictionary}")
+
+                        # Remove speakers with less than 5 utterances from subset,
+                        # can't estimate speaker transforms well for low utterance counts
+                        sq = (
+                            session.query(
+                                Utterance.speaker_id.label("speaker_id"),
+                                sqlalchemy.func.count(Utterance.id).label("utt_count"),
+                            )
+                            .filter(Utterance.in_subset == True)  # noqa
+                            .group_by(Utterance.speaker_id.label("speaker_id"))
+                            .subquery()
+                        )
+                        speaker_ids = [
+                            x for x, in session.query(sq.c.speaker_id).filter(sq.c.utt_count < 5)
+                        ]
+                        session.query(Utterance).filter(
+                            Utterance.speaker_id.in_(speaker_ids)
+                        ).update({Utterance.in_subset: False})
+                        session.commit()
+                        logger.debug(f"For {dict_name}, subset is {subset_per_dictionary}")
                     elif num_utts > subset_per_dictionary:
                         larger_subset_query = (
                             session.query(Utterance.id)
                             .join(Utterance.speaker)
-                            .filter(Speaker.dictionary_id == dict_id)
-                            .filter(Utterance.ignored == False)  # noqa
+                            .filter(Speaker.dictionary_id == dict_id)  # noqa
                         )
+                        larger_subset_query = add_filters(larger_subset_query)
+                        if speaker_ids:
+                            larger_subset_query = larger_subset_query.filter(
+                                Speaker.id.in_(speaker_ids)
+                            )
                         sq = larger_subset_query.subquery()
                         subset_utts = (
                             sqlalchemy.select(sq.c.id)
@@ -1205,17 +1384,72 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
                             .where(Utterance.id.in_(subset_utts))
                         )
                         session.execute(query)
+                        session.commit()
 
-                        logger.debug(f"For {dict_id}, subset is {subset_per_dictionary}")
+                        logger.debug(f"For {dict_name}, subset is {subset_per_dictionary}")
                     else:
                         larger_subset_query = (
                             session.query(Utterance.id)
                             .join(Utterance.speaker)
                             .filter(Speaker.dictionary_id == dict_id)
                             .filter(Utterance.ignored == False)  # noqa
+                            .filter(
+                                sqlalchemy.or_(
+                                    Utterance.duration_deviation == None,  # noqa
+                                    Utterance.duration_deviation < 10,
+                                )
+                            )  # noqa
                         )
                         sq = larger_subset_query.subquery()
                         subset_utts = sqlalchemy.select(sq.c.id).scalar_subquery()
+                        query = (
+                            sqlalchemy.update(Utterance)
+                            .execution_options(synchronize_session="fetch")
+                            .values(in_subset=True)
+                            .where(Utterance.id.in_(subset_utts))
+                        )
+                        session.execute(query)
+                        session.commit()
+
+                    # Reassign any utterances from speakers below utterance count threshold
+                    sq = (
+                        session.query(
+                            Utterance.speaker_id.label("speaker_id"),
+                            sqlalchemy.func.count(Utterance.id).label("utt_count"),
+                        )
+                        .join(Utterance.speaker)
+                        .filter(Speaker.dictionary_id == dict_id)
+                        .filter(Utterance.in_subset == True)  # noqa
+                        .group_by(Utterance.speaker_id.label("speaker_id"))
+                        .subquery()
+                    )
+                    total_speaker_utterances = session.query(
+                        sqlalchemy.func.sum(sq.c.utt_count)
+                    ).first()[0]
+                    remaining = subset_per_dictionary - total_speaker_utterances
+                    if remaining > 0:
+                        speaker_ids = [x for x, in session.query(sq.c.speaker_id)]
+
+                        larger_subset_query = (
+                            session.query(Utterance.id)
+                            .join(Utterance.speaker)
+                            .filter(Speaker.dictionary_id == dict_id)  # noqa
+                        )
+                        larger_subset_query = add_filters(larger_subset_query)
+                        if speaker_ids:
+                            larger_subset_query = larger_subset_query.filter(
+                                Speaker.id.in_(speaker_ids)
+                            )
+                        larger_subset_query = larger_subset_query.order_by(
+                            Utterance.duration
+                        ).limit(remaining * 10)
+                        sq = larger_subset_query.subquery()
+                        subset_utts = (
+                            sqlalchemy.select(sq.c.id)
+                            .order_by(sqlalchemy.func.random())
+                            .limit(remaining)
+                            .scalar_subquery()
+                        )
                         query = (
                             sqlalchemy.update(Utterance)
                             .execution_options(synchronize_session="fetch")
@@ -1229,13 +1463,7 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
                 if subset < self.num_utterances:
                     # Get all shorter utterances that are not one word long
                     larger_subset_query = (
-                        session.query(Utterance.id)
-                        .filter(
-                            Utterance.normalized_text.op("~")(r"\s\S+\s")
-                            if config.USE_POSTGRES
-                            else Utterance.normalized_text.regexp_match(r"\s\S+\s")
-                        )
-                        .filter(Utterance.ignored == False)  # noqa
+                        add_filters(session.query(Utterance.id))
                         .order_by(Utterance.duration)
                         .limit(larger_subset_num)
                     )
@@ -1257,9 +1485,12 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
                     session.query(Utterance).update({Utterance.in_subset: True})
 
             session.commit()
+            subset_directory = self.corpus_output_directory.joinpath(f"subset_{subset}")
+            log_dir = subset_directory.joinpath("log")
+            os.makedirs(log_dir, exist_ok=True)
 
-            logger.debug(f"Setting subset flags took {time.time()-begin} seconds")
-            with self.session() as session, tqdm(total=subset, disable=config.QUIET) as pbar:
+            logger.debug(f"Setting subset flags took {time.time() - begin} seconds")
+            with self.session() as session:
                 jobs = (
                     session.query(Job)
                     .options(
@@ -1269,12 +1500,16 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
                 )
                 self._jobs = jobs.all()
                 arguments = [
-                    ExportKaldiFilesArguments(j.id, self.session, None, subset_directory)
+                    ExportKaldiFilesArguments(
+                        j.id,
+                        getattr(self, "session" if config.USE_THREADING else "db_string", ""),
+                        None,
+                        subset_directory,
+                    )
                     for j in self._jobs
                 ]
-
-                for _ in run_kaldi_function(ExportKaldiFilesFunction, arguments, pbar.update):
-                    pass
+            for _ in run_kaldi_function(ExportKaldiFilesFunction, arguments, total_count=subset):
+                pass
 
     @property
     def num_files(self) -> int:
@@ -1324,10 +1559,14 @@ class CorpusMixin(MfaWorker, DatabaseMixin, metaclass=ABCMeta):
                 c.current_subset = subset
             session.commit()
         if subset is None or subset >= self.num_utterances or subset <= 0:
+            if hasattr(self, "subset_lexicon"):
+                self.subset_lexicon()
             return self.split_directory
         directory = self.corpus_output_directory.joinpath(f"subset_{subset}")
         if not os.path.exists(directory):
             self.create_subset(subset)
+            if hasattr(self, "subset_lexicon"):
+                self.subset_lexicon()
         return directory
 
     def get_latest_workflow_run(self, workflow: WorkflowType, session: Session) -> CorpusWorkflow:

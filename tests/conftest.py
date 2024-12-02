@@ -78,11 +78,11 @@ def generated_dir(test_dir):
 def global_config():
     config.CURRENT_PROFILE_NAME = "test"
     config.CLEAN = True
-    config.USE_POSTGRES = False
+    config.USE_POSTGRES = True
     config.DEBUG = True
-    config.VERBOSE = True
+    config.VERBOSE = False
     config.NUM_JOBS = 2
-    config.USE_MP = False
+    config.USE_MP = True
     config.DATABASE_LIMITED_MODE = True
     config.AUTO_SERVER = False
     config.TEMPORARY_DIRECTORY = get_temporary_directory()
@@ -996,11 +996,11 @@ def multispeaker_dictionary_config_path(generated_dir, basic_dict_path, english_
 
 
 @pytest.fixture(scope="session")
-def mfa_speaker_dict_path(generated_dir, english_uk_mfa_dictionary, english_us_mfa_dictionary):
+def mfa_speaker_dict_path(generated_dir, english_uk_mfa_dictionary, english_us_mfa_reduced_dict):
     path = generated_dir.joinpath("test_multispeaker_mfa_dictionary.yaml")
     with mfa_open(path, "w") as f:
         yaml.dump(
-            {"default": english_us_mfa_dictionary, "speaker": english_uk_mfa_dictionary},
+            {"default": english_us_mfa_reduced_dict, "speaker": english_us_mfa_reduced_dict},
             f,
             Dumper=yaml.Dumper,
             allow_unicode=True,
@@ -1009,5 +1009,204 @@ def mfa_speaker_dict_path(generated_dir, english_uk_mfa_dictionary, english_us_m
 
 
 @pytest.fixture(scope="session")
+def english_mfa_phone_groups_path(config_directory):
+    path = config_directory.joinpath("acoustic", "english_mfa_phone_groups.yaml")
+    return path
+
+
+@pytest.fixture(scope="session")
+def english_mfa_rules_path(config_directory):
+    path = config_directory.joinpath("acoustic", "english_mfa_rules.yaml")
+    return path
+
+
+@pytest.fixture(scope="session")
+def english_mfa_topology_path(config_directory):
+    path = config_directory.joinpath("acoustic", "english_mfa_topology.yaml")
+    return path
+
+
+@pytest.fixture(scope="session")
+def bad_topology_path(config_directory):
+    path = config_directory.joinpath("acoustic", "bad_topology.yaml")
+    return path
+
+
+@pytest.fixture(scope="session")
 def test_align_config():
     return {"beam": 100, "retry_beam": 400}
+
+
+@pytest.fixture(scope="session")
+def reference_transcripts():
+    return {
+        "mfa_cutoff": "<cutoff-montreal> montreal <cutoff-montreal> <cutoff-montreal> montreal <cutoff-forced> <cutoff-forced> forced <cutoff-aligner> aligner <cutoff-aligner> aligner",
+        "mfa_whatscalled": "montreal forced what's called aligner",
+        "mfa_uhuh": "montreal uh uh uh uh uh uh forced aligner",
+        "mfa_uhum": "montreal forced uh um uh hm hm um forced aligner",
+        "mfa_michael": "montreal forced aligner",
+        "mfa_kmg": "montreal forced aligner",
+        "mfa_falsetto": "montreal forced aligner",
+        "mfa_whisper": "montreal forced aligner",
+        "mfa_exaggerated": "montreal forced aligner",
+        "mfa_breathy": "montreal forced aligner",
+        "mfa_creaky": "montreal forced aligner",
+        "mfa_long": "montreal forced aligner",
+        "mfa_hes": "montreal <hes-forced> aligner",
+        "mfa_longstop": "this is a long stop",
+        "mfa_putty": "m f a is like putty",
+        "mfa_puddy": "m f a is like puddy",
+        "mfa_puttynorm": "m f a is like putty",
+        "mfa_pooty": "m f a is like pooty",
+        "mfa_bottle": "m f a is like bottle",
+        "mfa_patty": "m f a is like patty",
+        "mfa_buddy": "m f a is like buddy",
+        "mfa_apex": "m f a is like apex",
+        "mfa_poofy": "m f a is like poofy",
+        "mfa_reallylong": "m f a is like this is so many words right here",
+        "mfa_internalsil": "<hes-montreal> <hes-forced> <hes-aligner>",
+        "mfa_her": "montreal forced aligner i hardly know her",
+        "mfa_er": "montreal forced aligner i hardly know 'er",
+        "mfa_erpause": "montreal forced aligner i hardly know 'er",
+        "mfa_cutoffprogressive": "<cutoff-montreal> <cutoff-montreal> uh <cutoff-montreal> montreal <cutoff-forced> forced <cutoff-aligner> <cutoff-aligner> hm <cutoff-aligner> <cutoff-aligner> aligner aligner",
+        "mfa_affectation": "montreal forced aligner",
+        "mfa_crossword": "but um montreal but um but montreal forced aligner",
+        "mfa_registershift": "montreal forced forced aligner",
+        "falsetto": "this is all very high pitched",
+        "falsetto2": "i really don't know how people talk like this",
+        "whisper": "this is all very whispered",
+        "whisper2": "there's gonna be no voiced speech whatsoever here",
+        "mfa_uh": "montreal uh forced aligner",
+        "mfa_um": "montreal forced um aligner",
+        "mfa_youknow": "you know montreal forced aligner",
+        "mfa_unk": "montreal forced <unk> aligner",
+        "mfa_words": "montreal forced aligner word another word here's some more word word word word word",
+        "mfa_surround": "this one montreal is going to be forced very bad aligner but what are you gonna do",
+        "mfa_breaths": "montreal forced aligner",
+        "mfa_laughter": "[laughter] montreal [laughter] forced [laughter] aligner [laughter]",
+        "mfa_the": "the montreal forced aligner",
+        "mfa_thenorm": "the montreal forced aligner",
+        "mfa_thestop": "this is the montreal forced aligner",
+        "mfa_theapprox": "this is the montreal forced aligner",
+        "mfa_thez": "this is the montreal forced aligner",
+        "mfa_thea": "this is a montreal forced aligner",
+        "mfa_theinitialstop": "the montreal forced aligner",
+        "mfa_theother": "this is the other montreal forced aligner",
+        "mfa_thoughts": "i have a thousand thoughts about that thing",
+    }
+
+
+@pytest.fixture(scope="session")
+def filler_insertion_utterances():
+    return [
+        "mfa_michael",
+        "mfa_uh",
+        "mfa_um",
+        "mfa_youknow",
+        "mfa_unk",
+        "mfa_words",
+        "mfa_surround",
+        "mfa_breaths",
+        "mfa_laughter",
+        "mfa_cutoffprogressive",
+        "mfa_uhuh",
+        "mfa_uhum",
+        "mfa_whatscalled",
+        "mfa_cutoff",
+        "mfa_exaggerated",
+    ]
+
+
+@pytest.fixture(scope="session")
+def putty_utterances():
+    return [
+        "mfa_putty",
+        "mfa_puddy",
+        "mfa_puttynorm",
+        "mfa_pooty",
+        "mfa_bottle",
+        "mfa_patty",
+        "mfa_buddy",
+        "mfa_apex",
+        "mfa_poofy",
+        "mfa_reallylong",
+    ]
+
+
+@pytest.fixture(scope="session")
+def register_utterances():
+    return [
+        "mfa_michael",
+        "mfa_kmg",
+        "mfa_falsetto",
+        "mfa_whisper",
+        "mfa_exaggerated",
+        "mfa_breathy",
+        "mfa_creaky",
+        "mfa_registershift",
+        "falsetto",
+        "falsetto2",
+        "whisper",
+        "whisper2",
+    ]
+
+
+@pytest.fixture(scope="session")
+def pronunciation_variation_utterances():
+    return [
+        "mfa_crossword",
+        "mfa_her",
+        "mfa_er",
+        "mfa_erpause",
+        "mfa_the",
+        "mfa_thenorm",
+        "mfa_thestop",
+        "mfa_theapprox",
+        "mfa_thez",
+        "mfa_theinitialstop",
+        "mfa_theother",
+        "mfa_thoughts",
+    ]
+
+
+@pytest.fixture(scope="session")
+def cutoff_utterances():
+    return [
+        "mfa_cutoff",
+        "mfa_cutoffprogressive",
+        "mfa_internalsil",
+        "mfa_longstop",
+        "mfa_long",
+        "mfa_hes",
+    ]
+
+
+@pytest.fixture(scope="session")
+def filler_insertion_corpus(filler_insertion_utterances, corpus_root_dir, wav_dir, lab_dir):
+    path = corpus_root_dir.joinpath("test_filler_insertion")
+    path.mkdir(exist_ok=True, parents=True)
+    speaker_name = "michael"
+    s_dir = path.joinpath(speaker_name)
+    s_dir.mkdir(exist_ok=True, parents=True)
+    transcript = "montreal forced aligner"
+    for name in filler_insertion_utterances:
+        shutil.copyfile(wav_dir.joinpath(name + ".flac"), s_dir.joinpath(name + ".flac"))
+        with mfa_open(s_dir.joinpath(name + ".lab"), "w") as f:
+            f.write(transcript)
+    return path
+
+
+@pytest.fixture(scope="session")
+def pronunciation_variation_corpus(
+    pronunciation_variation_utterances, corpus_root_dir, wav_dir, lab_dir, reference_transcripts
+):
+    path = corpus_root_dir.joinpath("test_pronunciation_variation")
+    path.mkdir(exist_ok=True, parents=True)
+    speaker_name = "michael"
+    s_dir = path.joinpath(speaker_name)
+    s_dir.mkdir(exist_ok=True, parents=True)
+    for name in pronunciation_variation_utterances:
+        shutil.copyfile(wav_dir.joinpath(name + ".flac"), s_dir.joinpath(name + ".flac"))
+        with mfa_open(s_dir.joinpath(name + ".lab"), "w") as f:
+            f.write(reference_transcripts[name])
+    return path

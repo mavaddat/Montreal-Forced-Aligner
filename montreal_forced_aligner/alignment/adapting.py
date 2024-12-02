@@ -2,20 +2,18 @@
 from __future__ import annotations
 
 import logging
-import os
 import shutil
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, List
+from typing import List
 
 from _kalpy.gmm import AccumAmDiagGmm, IsmoothStatsAmDiagGmmFromModel
 from _kalpy.matrix import DoubleVector
 from kalpy.gmm.utils import read_gmm_model, write_gmm_model
 from kalpy.utils import kalpy_logger
-from tqdm.rich import tqdm
 
 from montreal_forced_aligner import config
-from montreal_forced_aligner.abc import AdapterMixin
+from montreal_forced_aligner.abc import AdapterMixin, MetaDict
 from montreal_forced_aligner.alignment.multiprocessing import AccStatsArguments, AccStatsFunction
 from montreal_forced_aligner.alignment.pretrained import PretrainedAligner
 from montreal_forced_aligner.data import WorkflowType
@@ -23,10 +21,6 @@ from montreal_forced_aligner.db import CorpusWorkflow
 from montreal_forced_aligner.exceptions import KaldiProcessingError
 from montreal_forced_aligner.models import AcousticModel
 from montreal_forced_aligner.utils import log_kaldi_errors, run_kaldi_function
-
-if TYPE_CHECKING:
-    from montreal_forced_aligner.models import MetaDict
-
 
 __all__ = ["AdaptingAligner"]
 
@@ -81,7 +75,7 @@ class AdaptingAligner(PretrainedAligner, AdapterMixin):
             arguments.append(
                 AccStatsArguments(
                     j.id,
-                    getattr(self, "session", ""),
+                    getattr(self, "session" if config.USE_THREADING else "db_string", ""),
                     self.working_log_directory.joinpath(f"map_acc_stats.{j.id}.log"),
                     self.working_directory,
                     model_path,
@@ -111,31 +105,32 @@ class AdaptingAligner(PretrainedAligner, AdapterMixin):
         gmm_accs = AccumAmDiagGmm()
         transition_model.InitStats(transition_accs)
         gmm_accs.init(acoustic_model)
-        with tqdm(total=self.num_current_utterances, disable=config.QUIET) as pbar:
-            for result in run_kaldi_function(AccStatsFunction, arguments, pbar.update):
-                if isinstance(result, tuple):
-                    job_transition_accs, job_gmm_accs = result
-                    transition_accs.AddVec(1.0, job_transition_accs)
-                    gmm_accs.Add(1.0, job_gmm_accs)
+        for result in run_kaldi_function(
+            AccStatsFunction, arguments, total_count=self.num_current_utterances
+        ):
+            if isinstance(result, tuple):
+                job_transition_accs, job_gmm_accs = result
+                transition_accs.AddVec(1.0, job_transition_accs)
+                gmm_accs.Add(1.0, job_gmm_accs)
         log_path = self.working_log_directory.joinpath("map_model_est.log")
         with kalpy_logger("kalpy.train", log_path):
             IsmoothStatsAmDiagGmmFromModel(acoustic_model, self.mapping_tau, gmm_accs)
             objf_impr, count = transition_model.mle_update(transition_accs)
             logger.debug(
-                f"Transition model update: Overall {objf_impr/count} "
+                f"Transition model update: Overall {objf_impr / count} "
                 f"log-like improvement per frame over {count} frames."
             )
             objf_impr, count = acoustic_model.mle_update(
                 gmm_accs, update_flags_str="m", remove_low_count_gaussians=False
             )
             logger.debug(
-                f"GMM update: Overall {objf_impr/count} "
+                f"GMM update: Overall {objf_impr / count} "
                 f"objective function improvement per frame over {count} frames."
             )
             tot_like = gmm_accs.TotLogLike()
             tot_t = gmm_accs.TotCount()
             logger.debug(
-                f"Average Likelihood per frame = {tot_like/tot_t} " f"over {tot_t} frames."
+                f"Average Likelihood per frame = {tot_like / tot_t} " f"over {tot_t} frames."
             )
             write_gmm_model(str(final_mdl_path), transition_model, acoustic_model)
 
@@ -161,7 +156,7 @@ class AdaptingAligner(PretrainedAligner, AdapterMixin):
         """Current acoustic model path"""
         if self.current_workflow.workflow_type == WorkflowType.acoustic_model_adaptation:
             path = self.working_directory.joinpath("unadapted.alimdl")
-            if os.path.exists(path) and not getattr(self, "uses_speaker_adaptation", False):
+            if path.exists() and not getattr(self, "uses_speaker_adaptation", False):
                 return path
             return self.model_path
         return super().alignment_model_path
@@ -194,7 +189,7 @@ class AdaptingAligner(PretrainedAligner, AdapterMixin):
         """
         begin = time.time()
         log_directory = self.working_log_directory
-        os.makedirs(log_directory, exist_ok=True)
+        log_directory.mkdir(parents=True, exist_ok=True)
         self.acc_stats(alignment=False)
 
         if self.uses_speaker_adaptation:
@@ -208,19 +203,17 @@ class AdaptingAligner(PretrainedAligner, AdapterMixin):
         self.align()
         alignment_workflow = self.current_workflow
         self.create_new_current_workflow(WorkflowType.acoustic_model_adaptation)
-        for f in ["final.mdl", "final.alimdl"]:
+        for f in ["final.mdl", "final.alimdl", "tree", "lda.mat"]:
+            path = alignment_workflow.working_directory.joinpath(f)
+            new_path = self.working_directory.joinpath(f)
+            if f.startswith("final"):
+                new_path = new_path.with_stem("unadapted")
+            if not path.exists():
+                continue
             shutil.copyfile(
-                os.path.join(alignment_workflow.working_directory, f),
-                self.working_directory.joinpath(f).with_stem("unadapted"),
+                path,
+                new_path,
             )
-        shutil.copyfile(
-            os.path.join(alignment_workflow.working_directory, "tree"),
-            self.working_directory.joinpath("tree"),
-        )
-        shutil.copyfile(
-            os.path.join(alignment_workflow.working_directory, "lda.mat"),
-            self.working_directory.joinpath("lda.mat"),
-        )
         for j in self.jobs:
             old_paths = j.construct_path_dictionary(
                 alignment_workflow.working_directory, "ali", "ark"
@@ -228,28 +221,18 @@ class AdaptingAligner(PretrainedAligner, AdapterMixin):
             new_paths = j.construct_path_dictionary(self.working_directory, "ali", "ark")
             for k, v in old_paths.items():
                 shutil.copyfile(v, new_paths[k])
-        os.makedirs(self.align_directory, exist_ok=True)
+        self.align_directory.mkdir(parents=True, exist_ok=True)
         try:
             logger.info("Adapting pretrained model...")
             self.train_map()
             self.export_model(self.working_log_directory.joinpath("acoustic_model.zip"))
-            shutil.copyfile(
-                self.working_directory.joinpath("final.mdl"),
-                os.path.join(self.align_directory, "final.mdl"),
-            )
-            shutil.copyfile(
-                self.working_directory.joinpath("tree"),
-                os.path.join(self.align_directory, "tree"),
-            )
-            if os.path.exists(self.working_directory.joinpath("final.alimdl")):
+            for f in ["final.mdl", "final.alimdl", "tree", "lda.mat"]:
+                path = self.working_directory.joinpath(f)
+                if not path.exists():
+                    continue
                 shutil.copyfile(
-                    self.working_directory.joinpath("final.alimdl"),
-                    os.path.join(self.align_directory, "final.alimdl"),
-                )
-            if os.path.exists(self.working_directory.joinpath("lda.mat")):
-                shutil.copyfile(
-                    self.working_directory.joinpath("lda.mat"),
-                    os.path.join(self.align_directory, "lda.mat"),
+                    path,
+                    self.align_directory.joinpath(f),
                 )
             wf = self.current_workflow
             with self.session() as session:
@@ -321,6 +304,5 @@ class AdaptingAligner(PretrainedAligner, AdapterMixin):
         acoustic_model.add_model(self.working_directory)
         acoustic_model.add_model(self.phones_dir)
         if directory:
-            os.makedirs(directory, exist_ok=True)
-        basename, _ = os.path.splitext(output_model_path)
+            directory.mkdir(parents=True, exist_ok=True)
         acoustic_model.dump(output_model_path)

@@ -54,7 +54,9 @@ def align_utterance_online(
                     if not lexicon_compiler.word_table.member(w):
                         pron = rewriter(w)
                         if pron:
-                            lexicon_compiler.add_pronunciation(KalpyPronunciation(w, pron[0]))
+                            lexicon_compiler.add_pronunciation(
+                                KalpyPronunciation(w, pron[0], None, None, None, None, None)
+                            )
 
         else:
             text, pronunciation_form = tokenizer(text)
@@ -70,14 +72,13 @@ def align_utterance_online(
                         g2p_cache[w] = pron[0]
                     if w in g2p_cache and not lexicon_compiler.word_table.member(norm_w):
                         lexicon_compiler.add_pronunciation(
-                            KalpyPronunciation(norm_w, g2p_cache[w])
+                            KalpyPronunciation(norm_w, g2p_cache[w], None, None, None, None, None)
                         )
 
     graph_compiler = TrainingGraphCompiler(
         acoustic_model.alignment_model_path,
         acoustic_model.tree_path,
         lexicon_compiler,
-        lexicon_compiler.word_table,
     )
     if utterance.mfccs is None:
         utterance.generate_mfccs(acoustic_model.mfcc_computer)
@@ -116,7 +117,7 @@ def align_utterance_online(
         acoustic_model.mfcc_computer.frame_shift,
     )
     ctm = lexicon_compiler.phones_to_pronunciations(
-        utterance.transcript, alignment.words, phone_intervals, transcription=False
+        alignment.words, phone_intervals, transcription=False, text=utterance.transcript
     )
     ctm.likelihood = alignment.likelihood
     ctm.update_utterance_boundaries(utterance.segment.begin, utterance.segment.end)

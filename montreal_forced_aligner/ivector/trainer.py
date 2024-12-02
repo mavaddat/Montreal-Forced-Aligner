@@ -14,7 +14,6 @@ from _kalpy import ivector
 from _kalpy.gmm import AccumDiagGmm, DiagGmm, FullGmm, MleDiagGmmOptions, StringToGmmFlags
 from _kalpy.matrix import FloatMatrix, MatrixResizeType
 from kalpy.utils import kalpy_logger, read_kaldi_object, write_kaldi_object
-from tqdm.rich import tqdm
 
 from montreal_forced_aligner import config
 from montreal_forced_aligner.abc import MetaDict, ModelExporterMixin, TopLevelMfaWorker
@@ -65,13 +64,15 @@ class IvectorModelTrainingMixin(AcousticModelTrainingMixin):
 
         from ..utils import get_mfa_version
 
-        data = {
+        meta = {
             "version": get_mfa_version(),
             "architecture": self.architecture,
             "train_date": str(datetime.now()),
             "features": self.feature_options,
         }
-        return data
+        if self.model_version is not None:
+            meta["version"] = self.model_version
+        return meta
 
     def refresh_training_graph_compilers(self):
         pass
@@ -98,8 +99,7 @@ class IvectorModelTrainingMixin(AcousticModelTrainingMixin):
         ivector_extractor.add_model(self.working_directory)
         if directory:
             os.makedirs(directory, exist_ok=True)
-        basename, _ = os.path.splitext(output_model_path)
-        ivector_extractor.dump(basename)
+        ivector_extractor.dump(output_model_path)
 
 
 class DubmTrainer(IvectorModelTrainingMixin):
@@ -187,7 +187,7 @@ class DubmTrainer(IvectorModelTrainingMixin):
             arguments.append(
                 GmmGselectArguments(
                     j.id,
-                    getattr(self, "session", ""),
+                    getattr(self, "session" if config.USE_THREADING else "db_string", ""),
                     self.working_log_directory.joinpath(f"gmm_gselect.{j.id}.log"),
                     self.working_directory,
                     self.model_path,
@@ -213,7 +213,7 @@ class DubmTrainer(IvectorModelTrainingMixin):
             arguments.append(
                 AccGlobalStatsArguments(
                     j.id,
-                    getattr(self, "session", ""),
+                    getattr(self, "session" if config.USE_THREADING else "db_string", ""),
                     os.path.join(
                         self.working_log_directory,
                         f"acc_global_stats.{self.iteration}.{j.id}.log",
@@ -242,9 +242,10 @@ class DubmTrainer(IvectorModelTrainingMixin):
         begin = time.time()
         logger.info("Selecting gaussians...")
         arguments = self.gmm_gselect_arguments()
-        with tqdm(total=self.num_current_utterances, disable=config.QUIET) as pbar:
-            for _ in run_kaldi_function(GmmGselectFunction, arguments, pbar.update):
-                pass
+        for _ in run_kaldi_function(
+            GmmGselectFunction, arguments, total_count=self.num_current_utterances
+        ):
+            pass
 
         logger.debug(f"Gaussian selection took {time.time() - begin:.3f} seconds")
 
@@ -263,7 +264,6 @@ class DubmTrainer(IvectorModelTrainingMixin):
             random.seed(config.SEED)
             for _, current_feats in feature_archive:
                 for t in range(current_feats.NumRows()):
-
                     if num_read == 0:
                         dim = current_feats.NumCols()
                         feats.Resize(self.num_frames, current_feats.NumCols())
@@ -329,10 +329,11 @@ class DubmTrainer(IvectorModelTrainingMixin):
         gmm_accs = AccumDiagGmm()
         model: DiagGmm = read_kaldi_object(DiagGmm, self.model_path)
         gmm_accs.Resize(model, StringToGmmFlags("mvw"))
-        with tqdm(total=self.num_current_utterances, disable=config.QUIET) as pbar:
-            for result in run_kaldi_function(AccGlobalStatsFunction, arguments, pbar.update):
-                if isinstance(result, AccumDiagGmm):
-                    gmm_accs.Add(1.0, result)
+        for result in run_kaldi_function(
+            AccGlobalStatsFunction, arguments, total_count=self.num_current_utterances
+        ):
+            if isinstance(result, AccumDiagGmm):
+                gmm_accs.Add(1.0, result)
 
         logger.debug(f"Accumulating stats took {time.time() - begin:.3f} seconds")
 
@@ -361,7 +362,7 @@ class DubmTrainer(IvectorModelTrainingMixin):
         """Finalize DUBM training"""
         final_dubm_path = self.working_directory.joinpath("final.dubm")
         shutil.copy(
-            self.working_directory.joinpath(f"{self.num_iterations+1}.dubm"),
+            self.working_directory.joinpath(f"{self.num_iterations + 1}.dubm"),
             final_dubm_path,
         )
         # Update VAD with dubm likelihoods
@@ -435,7 +436,7 @@ class IvectorTrainer(IvectorModelTrainingMixin, IvectorConfigMixin):
             arguments.append(
                 AccIvectorStatsArguments(
                     j.id,
-                    getattr(self, "session", ""),
+                    getattr(self, "session" if config.USE_THREADING else "db_string", ""),
                     os.path.join(
                         self.working_log_directory, f"ivector_acc.{self.iteration}.{j.id}.log"
                     ),
@@ -456,7 +457,6 @@ class IvectorTrainer(IvectorModelTrainingMixin, IvectorConfigMixin):
 
         if not os.path.exists(self.ie_path):
             with kalpy_logger("kalpy.ivector", log_path):
-
                 gmm = read_kaldi_object(DiagGmm, diag_ubm_path)
                 fgmm = FullGmm()
                 fgmm.CopyFromDiagGmm(gmm)
@@ -482,7 +482,7 @@ class IvectorTrainer(IvectorModelTrainingMixin, IvectorConfigMixin):
             arguments.append(
                 GaussToPostArguments(
                     j.id,
-                    getattr(self, "session", ""),
+                    getattr(self, "session" if config.USE_THREADING else "db_string", ""),
                     self.working_log_directory.joinpath(f"gauss_to_post.{j.id}.log"),
                     self.working_directory,
                     self.dubm_path,
@@ -508,9 +508,10 @@ class IvectorTrainer(IvectorModelTrainingMixin, IvectorConfigMixin):
         logger.info("Extracting posteriors...")
         arguments = self.gauss_to_post_arguments()
 
-        with tqdm(total=self.num_current_utterances, disable=config.QUIET) as pbar:
-            for _ in run_kaldi_function(GaussToPostFunction, arguments, pbar.update):
-                pass
+        for _ in run_kaldi_function(
+            GaussToPostFunction, arguments, total_count=self.num_current_utterances
+        ):
+            pass
 
         logger.debug(f"Extracting posteriors took {time.time() - begin:.3f} seconds")
 
@@ -585,10 +586,11 @@ class IvectorTrainer(IvectorModelTrainingMixin, IvectorConfigMixin):
         model: ivector.IvectorExtractor = read_kaldi_object(ivector.IvectorExtractor, self.ie_path)
         options = ivector.IvectorExtractorStatsOptions()
         ivector_stats = ivector.IvectorExtractorStats(model, options)
-        with tqdm(total=self.worker.num_utterances, disable=config.QUIET) as pbar:
-            for result in run_kaldi_function(AccIvectorStatsFunction, arguments, pbar.update):
-                if isinstance(result, ivector.IvectorExtractorStats):
-                    ivector_stats.Add(result)
+        for result in run_kaldi_function(
+            AccIvectorStatsFunction, arguments, total_count=self.worker.num_utterances
+        ):
+            if isinstance(result, ivector.IvectorExtractorStats):
+                ivector_stats.Add(result)
 
         logger.debug(f"Accumulating stats took {time.time() - begin:.3f} seconds")
 
@@ -790,7 +792,7 @@ class TrainableIvectorExtractor(IvectorCorpusMixin, TopLevelMfaWorker, ModelExpo
             self.set_current_workflow(trainer.identifier)
             trainer.train()
             previous = trainer
-        logger.info(f"Completed training in {time.time()-begin} seconds!")
+        logger.info(f"Completed training in {time.time() - begin} seconds!")
 
     def export_model(self, output_model_path: Path) -> None:
         """

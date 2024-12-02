@@ -11,6 +11,7 @@ import queue
 import statistics
 import time
 import typing
+import unicodedata
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
@@ -92,6 +93,17 @@ def threshold_lattice_to_dfa(
     return lattice
 
 
+def generate_scored_paths(lattice, output_token_type):
+    paths = lattice.paths(output_token_type=output_token_type)
+    output = []
+    while not paths.done():
+        score = float(paths.weight())
+        ostring = paths.ostring()
+        output.append((ostring, score))
+        paths.next()
+    return output
+
+
 def optimal_rewrites(
     string: pynini.FstLike,
     rule: pynini.Fst,
@@ -111,7 +123,31 @@ def optimal_rewrites(
     """
     lattice = rewrite.rewrite_lattice(string, rule, input_token_type)
     lattice = threshold_lattice_to_dfa(lattice, threshold, 4)
-    return rewrite.lattice_to_strings(lattice, output_token_type)
+    return generate_scored_paths(lattice, output_token_type)
+
+
+def scored_top_rewrites(
+    string: pynini.FstLike,
+    rule: pynini.Fst,
+    nshortest: int,
+    input_token_type: Optional[pynini.TokenType] = None,
+    output_token_type: Optional[pynini.TokenType] = None,
+) -> List[str]:
+    """Returns the top n rewrites.
+
+    Args:
+    string: Input string or FST.
+    rule: Input rule WFST.
+    nshortest: The maximum number of rewrites to return.
+    input_token_type: Optional input token type, or symbol table.
+    output_token_type: Optional output token type, or symbol table.
+
+    Returns:
+    A list of output strings.
+    """
+    lattice = rewrite.rewrite_lattice(string, rule, input_token_type)
+    lattice = rewrite.lattice_to_nshortest(lattice, nshortest)
+    return generate_scored_paths(lattice, output_token_type)
 
 
 class Rewriter:
@@ -124,7 +160,7 @@ class Rewriter:
         G2P FST model
     input_token_type: pynini.TokenType
         Grapheme symbol table or "utf8"
-    output_token_type: pynini.SymbolTable
+    phone_symbol_table: pynini.SymbolTable
         Phone symbol table
     num_pronunciations: int
         Number of pronunciations, default to 0.  If this is 0, thresholding is used
@@ -135,20 +171,22 @@ class Rewriter:
     def __init__(
         self,
         fst: Fst,
-        input_token_type: TokenType,
+        grapheme_symbol_table: SymbolTable,
         phone_symbol_table: SymbolTable,
         num_pronunciations: int = 0,
         threshold: float = 1,
         graphemes: Set[str] = None,
         strict: bool = False,
+        unicode_decomposition: bool = False,
     ):
         self.graphemes = graphemes
-        self.input_token_type = input_token_type
+        self.grapheme_symbol_table = grapheme_symbol_table
         self.phone_symbol_table = phone_symbol_table
         self.strict = strict
+        self.unicode_decomposition = unicode_decomposition
         if num_pronunciations > 0:
             self.rewrite = functools.partial(
-                rewrite.top_rewrites,
+                scored_top_rewrites,
                 nshortest=num_pronunciations,
                 rule=fst,
                 input_token_type=None,
@@ -163,16 +201,18 @@ class Rewriter:
                 output_token_type=self.phone_symbol_table,
             )
 
-    def create_word_fst(self, word: str) -> pynini.Fst:
+    def create_word_fst(self, word: str) -> typing.Optional[pynini.Fst]:
         if self.graphemes is not None:
             if self.strict and any(x not in self.graphemes for x in word):
                 return None
             word = "".join([x for x in word if x in self.graphemes])
-        fst = pynini.accep(word, token_type=self.input_token_type)
+        fst = pynini.accep(word, token_type=self.grapheme_symbol_table)
         return fst
 
     def __call__(self, graphemes: str) -> List[str]:  # pragma: no cover
         """Call the rewrite function"""
+        if self.unicode_decomposition:
+            graphemes = unicodedata.normalize("NFKD", graphemes)
         if " " in graphemes:
             words = graphemes.split()
             hypotheses = []
@@ -181,16 +221,22 @@ class Rewriter:
                 if not w_fst:
                     continue
                 hypotheses.append(self.rewrite(w_fst))
-            hypotheses = sorted(set(" ".join(x) for x in itertools.product(*hypotheses)))
+            hypotheses = sorted(
+                (
+                    (" ".join([y[0] for y in x]), sum([y[1] for y in x]))
+                    for x in itertools.product(*hypotheses)
+                ),
+                key=lambda x: x[1],
+            )
         else:
             fst = self.create_word_fst(graphemes)
             if not fst:
                 return []
             hypotheses = self.rewrite(fst)
-        return [x for x in hypotheses if x]
+        return [x for x in hypotheses if x[0]]
 
 
-class PhonetisaurusRewriter:
+class PhonetisaurusRewriter(Rewriter):
     """
     Helper function for rewriting
 
@@ -223,30 +269,20 @@ class PhonetisaurusRewriter:
         sequence_separator: str = "|",
         graphemes: Set[str] = None,
         strict: bool = False,
+        unicode_decomposition: bool = False,
     ):
-        self.fst = fst
+        super().__init__(
+            fst,
+            grapheme_symbol_table,
+            phone_symbol_table,
+            num_pronunciations,
+            threshold,
+            graphemes,
+            strict,
+            unicode_decomposition,
+        )
         self.sequence_separator = sequence_separator
-        self.grapheme_symbol_table = grapheme_symbol_table
-        self.phone_symbol_table = phone_symbol_table
         self.grapheme_order = grapheme_order
-        self.graphemes = graphemes
-        self.strict = strict
-        if num_pronunciations > 0:
-            self.rewrite = functools.partial(
-                rewrite.top_rewrites,
-                nshortest=num_pronunciations,
-                rule=fst,
-                input_token_type=None,
-                output_token_type=self.phone_symbol_table,
-            )
-        else:
-            self.rewrite = functools.partial(
-                optimal_rewrites,
-                threshold=threshold,
-                rule=fst,
-                input_token_type=None,
-                output_token_type=self.phone_symbol_table,
-            )
 
     def create_word_fst(self, word: str) -> typing.Optional[pynini.Fst]:
         if self.graphemes is not None:
@@ -278,22 +314,8 @@ class PhonetisaurusRewriter:
 
     def __call__(self, graphemes: str) -> List[str]:  # pragma: no cover
         """Call the rewrite function"""
-        if " " in graphemes:
-            words = graphemes.split()
-            hypotheses = []
-            for w in words:
-                w_fst = self.create_word_fst(w)
-                if not w_fst:
-                    continue
-                hypotheses.append(self.rewrite(w_fst))
-            hypotheses = sorted(set(" ".join(x) for x in itertools.product(*hypotheses)))
-        else:
-            fst = self.create_word_fst(graphemes)
-            if not fst:
-                return []
-            hypotheses = self.rewrite(fst)
-        hypotheses = [x.replace(self.sequence_separator, " ") for x in hypotheses if x]
-        return hypotheses
+        hypotheses = super().__call__(graphemes)
+        return [(x.replace(self.sequence_separator, " "), score) for x, score in hypotheses if x]
 
 
 class RewriterWorker(mp.Process):
@@ -318,20 +340,24 @@ class RewriterWorker(mp.Process):
         return_queue: mp.Queue,
         rewriter: Rewriter,
         stopped: mp.Event,
+        finished_adding: mp.Event,
     ):
         super().__init__()
         self.job_queue = job_queue
         self.return_queue = return_queue
         self.rewriter = rewriter
         self.stopped = stopped
+        self.finished_adding = finished_adding
         self.finished = mp.Event()
 
     def run(self) -> None:
         """Run the rewriting function"""
         while True:
             try:
-                word = self.job_queue.get(timeout=1)
+                word = self.job_queue.get(timeout=0.01)
             except queue.Empty:
+                if not self.finished_adding.is_set():
+                    continue
                 break
             if self.stopped.is_set():
                 continue
@@ -356,8 +382,8 @@ class G2PArguments(MfaArguments):
     ----------
     job_name: int
         Integer ID of the job
-    db_string: str
-        String for database connections
+    session: :class:`sqlalchemy.orm.scoped_session` or str
+        SqlAlchemy scoped session or string for database connections
     log_path: :class:`~pathlib.Path`
         Path to save logging information during the run
     tree_path: :class:`~pathlib.Path`
@@ -431,19 +457,19 @@ class OrthographyGenerator(G2PTopLevelMixin):
         For top level G2P generation parameters
     """
 
-    def generate_pronunciations(self) -> Dict[str, List[str]]:
+    def generate_pronunciations(
+        self,
+    ) -> typing.Generator[typing.Tuple[str, List[typing.Tuple[str, float]]]]:
         """
         Generate pronunciations for the word set
 
-        Returns
+        Yields
         -------
-        dict[str, Word]
-            Mapping of words to their "pronunciation"
+        str, list[tuple[str, float]]]
+            Tuple of word with their scored pronunciations
         """
-        pronunciations = {}
         for word in self.words_to_g2p:
-            pronunciations[word] = [" ".join(word)]
-        return pronunciations
+            yield word, [(" ".join(word), 0.0)]
 
 
 class PyniniGenerator(G2PTopLevelMixin):
@@ -510,8 +536,10 @@ class PyniniGenerator(G2PTopLevelMixin):
     def setup(self):
         self.fst = pynini.Fst.read(self.g2p_model.fst_path)
         if self.g2p_model.meta["architecture"] == "phonetisaurus":
-            self.output_token_type = pynini.SymbolTable.read_text(self.g2p_model.sym_path)
-            self.input_token_type = pynini.SymbolTable.read_text(self.g2p_model.grapheme_sym_path)
+            self.output_token_type = pywrapfst.SymbolTable.read_text(self.g2p_model.sym_path)
+            self.input_token_type = pywrapfst.SymbolTable.read_text(
+                self.g2p_model.grapheme_sym_path
+            )
             self.fst.set_input_symbols(self.input_token_type)
             self.fst.set_output_symbols(self.output_token_type)
             self.rewriter = PhonetisaurusRewriter(
@@ -525,7 +553,7 @@ class PyniniGenerator(G2PTopLevelMixin):
             )
         else:
             if self.g2p_model.sym_path is not None and os.path.exists(self.g2p_model.sym_path):
-                self.output_token_type = pynini.SymbolTable.read_text(self.g2p_model.sym_path)
+                self.output_token_type = pywrapfst.SymbolTable.read_text(self.g2p_model.sym_path)
 
             self.rewriter = Rewriter(
                 self.fst,
@@ -536,14 +564,16 @@ class PyniniGenerator(G2PTopLevelMixin):
                 graphemes=self.g2p_model.meta["graphemes"],
             )
 
-    def generate_pronunciations(self) -> Dict[str, List[str]]:
+    def generate_pronunciations(
+        self,
+    ) -> typing.Generator[typing.Tuple[str, List[typing.Tuple[str, float]]]]:
         """
         Generate pronunciations
 
-        Returns
+        Yields
         -------
-        dict[str, list[str]]
-            Mappings of keys to their generated pronunciations
+        str, list[tuple[str, float]]]
+            Tuple of word with their scored pronunciations
         """
 
         num_words = len(self.words_to_g2p)
@@ -552,9 +582,10 @@ class PyniniGenerator(G2PTopLevelMixin):
         if self.rewriter is None:
             self.setup()
         logger.info("Generating pronunciations...")
-        to_return = {}
         skipped_words = 0
-        if num_words < 30 or config.NUM_JOBS == 1:
+        min_score = None
+        max_score = None
+        if not config.USE_MP or num_words < 30 or config.NUM_JOBS == 1:
             with tqdm(total=num_words, disable=config.QUIET) as pbar:
                 for word in self.words_to_g2p:
                     w, m = clean_up_word(word, self.g2p_model.meta["graphemes"])
@@ -570,14 +601,34 @@ class PyniniGenerator(G2PTopLevelMixin):
                         prons = self.rewriter(w)
                     except rewrite.Error:
                         continue
-                    to_return[word] = prons
+                    scores = [x[1] for x in prons]
+                    if min_score is not None:
+                        scores.append(min_score)
+                    if max_score is not None:
+                        scores.append(max_score)
+                    min_score = min(scores)
+                    max_score = min(scores)
+                    yield w, prons
                 logger.debug(
                     f"Skipping {skipped_words} words for containing the following graphemes: "
                     f"{comma_join(sorted(missing_graphemes))}"
                 )
         else:
             stopped = mp.Event()
+            finished_adding = mp.Event()
             job_queue = mp.Queue()
+            return_queue = mp.Queue()
+            procs = []
+            for _ in range(config.NUM_JOBS):
+                p = RewriterWorker(
+                    job_queue,
+                    return_queue,
+                    self.rewriter,
+                    stopped,
+                    finished_adding,
+                )
+                procs.append(p)
+                p.start()
             for word in self.words_to_g2p:
                 w, m = clean_up_word(word, self.g2p_model.meta["graphemes"])
                 missing_graphemes = missing_graphemes | m
@@ -592,18 +643,8 @@ class PyniniGenerator(G2PTopLevelMixin):
                 f"Skipping {skipped_words} words for containing the following graphemes: "
                 f"{comma_join(sorted(missing_graphemes))}"
             )
+            finished_adding.set()
             error_dict = {}
-            return_queue = mp.Queue()
-            procs = []
-            for _ in range(config.NUM_JOBS):
-                p = RewriterWorker(
-                    job_queue,
-                    return_queue,
-                    self.rewriter,
-                    stopped,
-                )
-                procs.append(p)
-                p.start()
             num_words -= skipped_words
             with tqdm(total=num_words, disable=config.QUIET) as pbar:
                 while True:
@@ -622,14 +663,22 @@ class PyniniGenerator(G2PTopLevelMixin):
                     if isinstance(result, Exception):
                         error_dict[word] = result
                         continue
-                    to_return[word] = result
+                    scores = [x[1] for x in result]
+                    if min_score is not None:
+                        scores.append(min_score)
+                    if max_score is not None:
+                        scores.append(max_score)
+                    min_score = min(scores)
+                    max_score = min(scores)
+                    yield word, result
 
             for p in procs:
                 p.join()
             if error_dict:
                 raise PyniniGenerationError(error_dict)
+        logger.debug(f"Minimum score: {min_score}")
+        logger.debug(f"Maximum score: {max_score}")
         logger.debug(f"Processed {num_words} in {time.time() - begin:.3f} seconds")
-        return to_return
 
 
 class PyniniConsoleGenerator(PyniniGenerator):
@@ -710,7 +759,7 @@ class PyniniValidator(PyniniGenerator, TopLevelMfaWorker):
         total_length = 0
         # Since the edit distance algorithm is quadratic, let's do this with
         # multiprocessing.
-        logger.debug(f"Processing results for {len(hypothesis_values)} hypotheses")
+        logger.debug("Processing results for hypotheses")
         to_comp = []
         indices = []
         hyp_pron_count = 0
@@ -755,14 +804,14 @@ class PyniniValidator(PyniniGenerator, TopLevelMfaWorker):
                 incorrect += 1
                 indices.append(word)
                 to_comp.append((gold_pronunciations, hyp))  # Multiple hypotheses to compare
-            logger.debug(
-                f"For the word {word}: gold is {gold_pronunciations}, hypothesized are: {hyp}"
-            )
+                logger.debug(
+                    f"Incorrect: for the word {word}: gold is {gold_pronunciations}, hypothesized are: {hyp}"
+                )
             hyp_pron_count += len(hyp)
             gold_pron_count += len(gold_pronunciations)
         logger.debug(
-            f"Generated an average of {hyp_pron_count /len(hypothesis_values)} variants "
-            f"The gold set had an average of {gold_pron_count/len(hypothesis_values)} variants."
+            f"Generated an average of {hyp_pron_count / len(hypothesis_values)} variants "
+            f"The gold set had an average of {gold_pron_count / len(hypothesis_values)} variants."
         )
         with ThreadPool(config.NUM_JOBS) as pool:
             gen = pool.starmap(score_g2p, to_comp)
@@ -814,8 +863,8 @@ class PyniniValidator(PyniniGenerator, TopLevelMfaWorker):
         gold_pronunciations: dict[str, set[str]]
             Gold pronunciations
         """
-        output = self.generate_pronunciations()
-        self.compute_validation_errors(gold_pronunciations, output)
+        hypotheses = {w: [x[0] for x in prons] for w, prons in self.generate_pronunciations()}
+        self.compute_validation_errors(gold_pronunciations, hypotheses)
 
 
 class PyniniWordListGenerator(PyniniValidator, DatabaseMixin):
@@ -907,7 +956,7 @@ class PyniniCorpusGenerator(PyniniGenerator, TextCorpusMixin, TopLevelMfaWorker)
         return [
             G2PArguments(
                 j.id,
-                getattr(self, "session", ""),
+                getattr(self, "session" if config.USE_THREADING else "db_string", ""),
                 self.working_log_directory.joinpath(f"g2p_utterances.{j.id}.log"),
                 self.rewriter,
             )
@@ -934,12 +983,11 @@ class PyniniCorpusGenerator(PyniniGenerator, TextCorpusMixin, TopLevelMfaWorker)
         if self.rewriter is None:
             self.setup()
         logger.info("Generating pronunciations...")
-        with tqdm(total=self.num_utterances, disable=config.QUIET) as pbar:
-            update_mapping = []
-            for utt_id, pronunciation in run_kaldi_function(
-                G2PFunction, self.g2p_arguments(), pbar.update
-            ):
-                update_mapping.append({"id": utt_id, "transcription_text": pronunciation})
+        update_mapping = []
+        for utt_id, (pronunciation, _) in run_kaldi_function(
+            G2PFunction, self.g2p_arguments(), total_count=self.num_utterances
+        ):
+            update_mapping.append({"id": utt_id, "transcription_text": pronunciation})
         with self.session() as session:
             bulk_update(session, Utterance, update_mapping)
             session.commit()
@@ -1003,11 +1051,18 @@ class PyniniCorpusGenerator(PyniniGenerator, TextCorpusMixin, TopLevelMfaWorker)
             word_list = [x for x in word_list if not self.check_bracketed(x)]
         return word_list
 
-    def export_pronunciations(self, output_file_path: typing.Union[str, Path]) -> None:
+    def export_pronunciations(
+        self,
+        output_file_path: typing.Union[str, Path],
+        export_scores: bool = False,
+        ensure_sorted: bool = False,
+    ) -> None:
         if self.per_utterance:
             self.export_file_pronunciations(output_file_path)
         else:
-            super().export_pronunciations(output_file_path)
+            super().export_pronunciations(
+                output_file_path, export_scores=export_scores, ensure_sorted=ensure_sorted
+            )
 
 
 class PyniniDictionaryCorpusGenerator(
@@ -1030,6 +1085,11 @@ class PyniniDictionaryCorpusGenerator(
         super().__init__(**kwargs)
         self._word_list = None
 
+    @property
+    def data_source_identifier(self) -> str:
+        """Corpus name"""
+        return os.path.basename(self.corpus_directory)
+
     def setup(self) -> None:
         """Set up the pronunciation generator"""
         if self.initialized:
@@ -1047,7 +1107,7 @@ class PyniniDictionaryCorpusGenerator(
                 query = (
                     session.query(Word.word)
                     .filter(Word.word_type == WordType.oov, Word.word != self.oov_word)
-                    .order_by(Word.word)
+                    .order_by(Word.count.desc())
                 )
             self._word_list = [x for x, in query]
         return self._word_list

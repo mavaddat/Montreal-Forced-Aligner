@@ -9,7 +9,6 @@ import threading
 import time
 import typing
 from pathlib import Path
-from queue import Queue
 
 import dataclassy
 
@@ -23,10 +22,9 @@ except ImportError:
 
 import numpy as np
 import sqlalchemy
-from _kalpy.ivector import Plda, ivector_normalize_length, ivector_subtract_mean
-from _kalpy.matrix import FloatVector
+from _kalpy.ivector import Plda
 from kalpy.data import Segment
-from kalpy.ivector.data import IvectorArchive
+from kalpy.ivector.plda import PldaScorer
 from scipy.spatial import distance
 from sklearn import cluster, manifold, metrics, neighbors, preprocessing
 from sqlalchemy.orm import joinedload
@@ -51,12 +49,19 @@ try:
         torch_logger = logging.getLogger("speechbrain.utils.train_logger")
         torch_logger.setLevel(logging.ERROR)
         import torch
-        from speechbrain.pretrained import EncoderClassifier, SpeakerRecognition
+
+        try:
+            from speechbrain.pretrained import EncoderClassifier, SpeakerRecognition
+        except ImportError:  # speechbrain 1.0
+            from speechbrain.inference.classifiers import EncoderClassifier
+            from speechbrain.inference.speaker import SpeakerRecognition
+        from speechbrain.utils.metric_stats import EER
     FOUND_SPEECHBRAIN = True
 except (ImportError, OSError):
     FOUND_SPEECHBRAIN = False
     EncoderClassifier = None
     SpeakerRecognition = None
+    EER = None
 
 __all__ = [
     "PldaClassificationArguments",
@@ -78,7 +83,7 @@ logger = logging.getLogger("mfa")
 class PldaClassificationArguments(MfaArguments):
     """Arguments for :class:`~montreal_forced_aligner.diarization.multiprocessing.PldaClassificationFunction`"""
 
-    plda: Plda
+    plda_path: Path
     train_ivector_path: Path
     num_utts_path: Path
     use_xvector: bool
@@ -124,7 +129,7 @@ def visualize_clusters(
         tsne_iterations = 500
         mds_iterations = 150
     if metric_type is DistanceMetric.plda:
-        metric = plda.log_likelihood_distance
+        metric = plda.log_likelihood_distance_vectorized
     if manifold_algorithm is ManifoldAlgorithm.mds:
         if metric_type is DistanceMetric.cosine:
             to_fit = preprocessing.normalize(ivectors, norm="l2")
@@ -286,7 +291,7 @@ def cluster_matrix(
     to_fit = ivectors
     score_metric_params = None
     if score_metric == "plda" and cluster_type is not ClusterType.affinity:
-        score_metric = plda.log_likelihood_distance
+        score_metric = plda.log_likelihood_distance_vectorized
     if cluster_type is ClusterType.affinity:
         affinity = metric
         if metric is DistanceMetric.cosine:
@@ -481,29 +486,16 @@ class PldaClassificationFunction(KaldiFunction):
 
     def __init__(self, args: PldaClassificationArguments):
         super().__init__(args)
-        self.plda = args.plda
+        self.plda_path = args.plda_path
         self.train_ivector_path = args.train_ivector_path
         self.num_utts_path = args.num_utts_path
         self.use_xvector = args.use_xvector
 
     def _run(self):
         """Run the function"""
-
-        ivector_archive = IvectorArchive(
-            self.train_ivector_path, num_utterances_file_name=self.num_utts_path
-        )
-        speaker_ivectors = []
-        speaker_ids = []
-        num_utts = []
-        for speaker_id, ivector, utts in ivector_archive:
-            speaker_ids.append(speaker_id)
-            num_utts.append(utts)
-            ivector_normalize_length(ivector)
-            speaker_ivectors.append(FloatVector(ivector))
-        ivector_subtract_mean(speaker_ivectors)
-        speaker_ivectors = self.plda.transform_ivectors(speaker_ivectors, num_utts)
+        plda_scorer = PldaScorer(self.plda_path)
+        plda_scorer.load_speaker_ivectors(self.train_ivector_path, self.num_utts_path)
         with self.session() as session:
-
             job: Job = (
                 session.query(Job)
                 .options(joinedload(Job.corpus, innerjoin=True))
@@ -517,10 +509,7 @@ class PldaClassificationFunction(KaldiFunction):
                 .order_by(Utterance.kaldi_id)
             )
             for u_id, u_ivector in utterances:
-                ivector = FloatVector()
-                ivector.from_numpy(u_ivector)
-                ind, score = self.plda.classify_utterance(ivector, speaker_ivectors, num_utts)
-                speaker = speaker_ids[ind]
+                speaker, score = plda_scorer.classify_speaker(u_ivector)
                 self.callback((u_id, speaker, score))
 
 
@@ -649,7 +638,6 @@ class SpeechbrainClassificationFunction(KaldiFunction):
         )
         device = torch.device("cuda" if self.cuda else "cpu")
         with self.session() as session:
-
             job: Job = (
                 session.query(Job)
                 .options(joinedload(Job.corpus, innerjoin=True))
@@ -713,7 +701,7 @@ class SpeechbrainEmbeddingFunction(KaldiFunction):
             run_opts=run_opts,
         )
 
-        return_q = Queue(2)
+        return_q = queue.Queue(2)
         finished_adding = threading.Event()
         stopped = threading.Event()
         loader = UtteranceFileLoader(
@@ -743,6 +731,7 @@ class SpeechbrainEmbeddingFunction(KaldiFunction):
                 .numpy()
                 .squeeze(axis=1)
             )
+            embeddings = preprocessing.normalize(embeddings)
             for i, u_id in enumerate(batch.utterance_id):
                 self.callback((int(u_id), embeddings[i]))
             del embeddings
@@ -768,7 +757,7 @@ class UtteranceFileLoader(threading.Thread):
         Job identifier
     session: sqlalchemy.orm.scoped_session
         Session
-    return_q: multiprocessing.Queue
+    return_q: :class:`~queue.Queue`
         Queue to put waveforms
     stopped: :class:`~threading.Event`
         Check for whether the process to exit gracefully
@@ -780,9 +769,11 @@ class UtteranceFileLoader(threading.Thread):
         self,
         job_name: int,
         session: sqlalchemy.orm.scoped_session,
-        return_q: Queue,
+        return_q: queue.Queue,
         stopped: threading.Event,
         finished_adding: threading.Event,
+        model=None,
+        for_xvector=True,
     ):
         super().__init__()
         self.job_name = job_name
@@ -790,6 +781,8 @@ class UtteranceFileLoader(threading.Thread):
         self.return_q = return_q
         self.stopped = stopped
         self.finished_adding = finished_adding
+        self.model = model
+        self.for_xvector = for_xvector
 
     def run(self) -> None:
         """
@@ -802,7 +795,10 @@ class UtteranceFileLoader(threading.Thread):
         @speechbrain.utils.data_pipeline.takes("segment")
         @speechbrain.utils.data_pipeline.provides("signal")
         def audio_pipeline(segment):
-            return segment.load_audio()
+            signal = torch.tensor(segment.load_audio())
+            if self.model is not None:
+                signal = self.model.audio_normalizer(signal, 16000)
+            return signal
 
         with self.session() as session:
             try:
@@ -816,9 +812,12 @@ class UtteranceFileLoader(threading.Thread):
                     )
                     .join(Utterance.file)
                     .join(File.sound_file)
-                    .filter(Utterance.xvector == None)  # noqa
                     .order_by(Utterance.duration.desc())
                 )
+                if self.for_xvector:
+                    utterances = utterances.filter(Utterance.xvector == None)  # noqa
+                else:
+                    utterances = utterances.filter(Utterance.job_id == self.job_name)
                 if not utterances.count():
                     self.finished_adding.set()
                     return
