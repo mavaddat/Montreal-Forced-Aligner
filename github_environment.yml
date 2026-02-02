@@ -2,13 +2,12 @@ channels:
   - conda-forge
 dependencies:
   - python=3.12
-  - numpy<2.1.0
+  - numpy<2.4.0
   - librosa
   - pysoundfile
   - tqdm
   - requests
   - pyyaml
-  - dataclassy
   - kaldi=*=*cpu*
   - scipy
   - pynini
